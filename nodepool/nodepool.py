@@ -723,7 +723,7 @@ class SubNodeLauncher(threading.Thread):
                                         (server_id, self.subnode_id,
                                          self.node_id, server['status']))
 
-        ip = server.get('public_v4')
+        ip = server.get('private_v4')
         if not ip and self.manager.hasExtension('os-floating-ips'):
             ip = self.manager.addPublicIP(server_id,
                                           pool=self.provider.pool)
@@ -1054,7 +1054,7 @@ class SnapshotImageUpdater(ImageUpdater):
             raise Exception("Server %s for image id: %s status: %s" %
                             (server_id, self.snap_image.id, server['status']))
 
-        ip = server.get('public_v4')
+        ip = server.get('private_v4')
         if not ip and self.manager.hasExtension('os-floating-ips'):
             ip = self.manager.addPublicIP(server_id,
                                           pool=self.provider.pool)
