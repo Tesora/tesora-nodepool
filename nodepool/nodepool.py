@@ -284,18 +284,36 @@ class GearmanClient(gear.Client):
                 continue
             for line in req.response.split('\n'):
                 parts = [x.strip() for x in line.split('\t')]
+                # parts[0] - function name
+                # parts[1] - total jobs queued (including building)
+                # parts[2] - jobs building
+                # parts[3] - workers registered
                 if not parts or parts[0] == '.':
                     continue
                 if not parts[0].startswith('build:'):
                     continue
                 function = parts[0][len('build:'):]
-                # total jobs in queue - running
-                queued = int(parts[1]) - int(parts[2])
+                # total jobs in queue (including building jobs)
+                # NOTE(jhesketh): Jobs that are being built are accounted for
+                # in the demand algorithm by subtracting the running nodes.
+                # If there are foreign (to nodepool) workers accepting jobs
+                # the demand will be higher than actually required. However
+                # better to have too many than too few and if you have a
+                # foreign worker this may be desired.
+                try:
+                    queued = int(parts[1])
+                except ValueError as e:
+                    self.__log.warn(
+                        'Server returned non-integer value in status. (%s)' %
+                        str(e))
+                    queued = 0
                 if queued > 0:
                     self.__log.debug("Function: %s queued: %s" % (function,
                                                                   queued))
                 if ':' in function:
                     fparts = function.split(':')
+                    # fparts[0] - function name
+                    # fparts[1] - target node [type]
                     job = fparts[-2]
                     worker = fparts[-1]
                     workers = job_worker_map.get(job, [])
@@ -316,6 +334,25 @@ class GearmanClient(gear.Client):
             needed_workers[worker] = (needed_workers.get(worker, 0) +
                                       queued)
         return needed_workers
+
+
+class InstanceDeleter(threading.Thread):
+    log = logging.getLogger("nodepool.InstanceDeleter")
+
+    def __init__(self, nodepool, provider_name, external_id):
+        threading.Thread.__init__(self, name='InstanceDeleter for %s %s' %
+                                  (provider_name, external_id))
+        self.nodepool = nodepool
+        self.provider_name = provider_name
+        self.external_id = external_id
+
+    def run(self):
+        try:
+            self.nodepool._deleteInstance(self.provider_name,
+                                          self.external_id)
+        except Exception:
+            self.log.exception("Exception deleting node %s:" %
+                               self.node_id)
 
 
 class NodeDeleter(threading.Thread):
@@ -1221,6 +1258,8 @@ class NodePool(threading.Thread):
         self._delete_threads_lock = threading.Lock()
         self._image_delete_threads = {}
         self._image_delete_threads_lock = threading.Lock()
+        self._instance_delete_threads = {}
+        self._instance_delete_threads_lock = threading.Lock()
         self._image_builder_queue = Queue.Queue()
         self._image_builder_thread = None
 
@@ -1535,13 +1574,18 @@ class NodePool(threading.Thread):
                 if self.config and self.config.crons[c.name].job:
                     self.apsched.unschedule_job(self.config.crons[c.name].job)
                 parts = c.timespec.split()
+                if len(parts) > 5:
+                    second = parts[5]
+                else:
+                    second = None
                 minute, hour, dom, month, dow = parts[:5]
                 c.job = self.apsched.add_cron_job(
                     cron_map[c.name],
                     day=dom,
                     day_of_week=dow,
                     hour=hour,
-                    minute=minute)
+                    minute=minute,
+                    second=second)
             else:
                 c.job = self.config.crons[c.name].job
 
@@ -1663,13 +1707,16 @@ class NodePool(threading.Thread):
             allocation_providers[provider.name] = ap
 
         # calculate demand for labels
-        # Actual need is demand - (ready + building)
+        # Actual need is: demand - (ready + building + used)
+        # NOTE(jhesketh): This assumes that the nodes in use are actually being
+        # used for a job in demand.
         for label in self.config.labels.values():
             start_demand = label_demand.get(label.name, 0)
             n_ready = count_nodes(label.name, nodedb.READY)
             n_building = count_nodes(label.name, nodedb.BUILDING)
+            n_used = count_nodes(label.name, nodedb.USED)
             n_test = count_nodes(label.name, nodedb.TEST)
-            ready = n_ready + n_building + n_test
+            ready = n_ready + n_building + n_used + n_test
 
             capacity = 0
             for provider in label.providers.values():
@@ -2245,6 +2292,26 @@ class NodePool(threading.Thread):
         dib_image.delete()
         self.log.info("Deleted dib image id: %s" % dib_image.id)
 
+    def deleteInstance(self, provider_name, external_id):
+        key = (provider_name, external_id)
+        try:
+            self._instance_delete_threads_lock.acquire()
+            if key in self._instance_delete_threads:
+                return
+            t = InstanceDeleter(self, provider_name, external_id)
+            self._instance_delete_threads[key] = t
+            t.start()
+        except Exception:
+            self.log.exception("Could not delete instance %s on provider %s",
+                               provider_name, external_id)
+        finally:
+            self._instance_delete_threads_lock.release()
+
+    def _deleteInstance(self, provider_name, external_id):
+        provider = self.config.providers[provider_name]
+        manager = self.getProviderManager(provider)
+        manager.cleanupServer(external_id)
+
     def _doPeriodicCleanup(self):
         try:
             self.periodicCleanup()
@@ -2301,7 +2368,62 @@ class NodePool(threading.Thread):
             except Exception:
                 self.log.exception("Exception cleaning up image id %s:" %
                                    dib_image_id)
+
+        try:
+            self.cleanupLeakedInstances()
+            pass
+        except Exception:
+            self.log.exception("Exception cleaning up leaked nodes")
+
         self.log.debug("Finished periodic cleanup")
+
+    def cleanupLeakedInstances(self):
+        known_providers = self.config.providers.keys()
+        with self.getDB().getSession() as session:
+            for provider in self.config.providers.values():
+                manager = self.getProviderManager(provider)
+                servers = manager.listServers()
+                for server in servers:
+                    meta = server.get('metadata', {}).get('nodepool')
+                    if not meta:
+                        self.log.debug("Instance %s (%s) in %s has no "
+                                       "nodepool metadata" % (
+                                           server['name'], server['id'],
+                                           provider.name))
+                        continue
+                    meta = json.loads(meta)
+                    if meta['provider_name'] not in known_providers:
+                        self.log.debug("Instance %s (%s) in %s "
+                                       "lists unknown provider %s" % (
+                                           server['name'], server['id'],
+                                           provider.name,
+                                           meta['provider_name']))
+                        continue
+                    snap_image_id = meta.get('snapshot_image_id')
+                    node_id = meta.get('node_id')
+                    if snap_image_id:
+                        if session.getSnapshotImage(snap_image_id):
+                            continue
+                        self.log.warning("Deleting leaked instance %s (%s) "
+                                         "in %s for snapshot image id %s" % (
+                                             server['name'], server['id'],
+                                             provider.name,
+                                             snap_image_id))
+                        self.deleteInstance(provider.name, server['id'])
+                    elif node_id:
+                        if session.getNode(node_id):
+                            continue
+                        self.log.warning("Deleting leaked instance %s (%s) "
+                                         "in %s for node id %s " % (
+                                             server['name'], server['id'],
+                                             provider.name, node_id))
+                        self.deleteInstance(provider.name, server['id'])
+                    else:
+                        self.log.warning("Instance %s (%s) in %s has no "
+                                         "database id" % (
+                                             server['name'], server['id'],
+                                             provider.name))
+                        continue
 
     def cleanupOneNode(self, session, node):
         now = time.time()
