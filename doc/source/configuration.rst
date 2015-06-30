@@ -189,6 +189,7 @@ will be built using the provider snapshot approach::
       - ubuntu
       - vm
       - puppet
+      - nodepool-base
       - node-devstack
     release: precise
     env-vars:
@@ -243,6 +244,7 @@ provider, the Nodepool image types are also defined (see
       template-hostname: '{image.name}-{timestamp}.template.openstack.org'
       pool: 'public'
       image-type: qcow2
+      ipv6-preferred: False
       networks:
         - net-id: 'some-uuid'
         - net-label: 'some-network-name'
@@ -252,7 +254,6 @@ provider, the Nodepool image types are also defined (see
           min-ram: 8192
           name-filter: 'something to match'
           setup: prepare_node.sh
-          reset: reset_node.sh
           username: jenkins
           user-home: '/home/jenkins'
           private-key: /var/lib/jenkins/.ssh/id_rsa
@@ -263,7 +264,6 @@ provider, the Nodepool image types are also defined (see
           base-image: 'Precise'
           min-ram: 8192
           setup: prepare_node.sh
-          reset: reset_node.sh
           username: jenkins
           user-home: '/home/jenkins'
           private-key: /var/lib/jenkins/.ssh/id_rsa
@@ -288,7 +288,6 @@ provider, the Nodepool image types are also defined (see
           base-image: 'Fake Precise'
           min-ram: 8192
           setup: prepare_node.sh
-          reset: reset_node.sh
           username: jenkins
           user-home: '/home/jenkins'
           private-key: /var/lib/jenkins/.ssh/id_rsa
@@ -348,6 +347,12 @@ provider, the Nodepool image types are also defined (see
     queried via the Nova os-tenant-networks API extension (this requires that
     the cloud provider has deployed this extension).
 
+  ``ipv6_preferred``
+    If it is set to True, nodepool will try to find ipv6 in public net first
+    as the ip address for ssh connection to build snapshot images and create
+    jenkins slave definition. If ipv6 is not found or the key is not
+    specified or set to False, ipv4 address will be used.
+
   ``pool``
     Specify a floating ip pool in cases where the 'public' pool is unavailable
     or undesirable.
@@ -381,7 +386,6 @@ Example::
       min-ram: 8192
       name-filter: 'something to match'
       setup: prepare_node.sh
-      reset: reset_node.sh
       username: jenkins
       private-key: /var/lib/jenkins/.ssh/id_rsa
       meta:
