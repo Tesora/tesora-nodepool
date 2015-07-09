@@ -477,7 +477,8 @@ class NodeLauncher(threading.Thread):
                                         (server_id, self.node.id,
                                          server['status']))
 
-        ip = server.get('public_v4')
+        # BH: hacked private IP support:
+        ip = server.get('private_v4')
         ip_v6 = server.get('public_v6')
         if self.provider.ipv6_preferred:
             if ip_v6:
