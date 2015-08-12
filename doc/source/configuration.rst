@@ -241,7 +241,7 @@ provider, the Nodepool image types are also defined (see
         - az1
       boot-timeout: 120
       launch-timeout: 900
-      template-hostname: '{image.name}-{timestamp}.template.openstack.org'
+      template-hostname: 'template-{image.name}-{timestamp}'
       pool: 'public'
       image-type: qcow2
       ipv6-preferred: False
@@ -324,9 +324,18 @@ provider, the Nodepool image types are also defined (see
     providing a different list of availabiltiy zones.
 
   ``boot-timeout``
+    Once an instance is active, how long to try connecting to the
+    image via SSH.  If the timeout is exceeded, the node launch is
+    aborted and the instance deleted.
+
     In seconds. Default 60.
 
   ``launch-timeout``
+
+    The time to wait from issuing the command to create a new instance
+    until that instance is reported as "active".  If the timeout is
+    exceeded, the node launch is aborted and the instance deleted.
+
     In seconds. Default 3600.
 
   ``image-type``
@@ -368,7 +377,7 @@ provider, the Nodepool image types are also defined (see
 
   ``template-hostname``
     Hostname template to use for the spawned instance.
-    Default ``{image.name}-{timestamp}.template.openstack.org``
+    Default ``template-{image.name}-{timestamp}``
 
   ``rate``
     In seconds. Default 1.0.
