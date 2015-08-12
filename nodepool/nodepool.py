@@ -1373,7 +1373,7 @@ class NodePool(threading.Thread):
             p.azs = provider.get('availability-zones')
             p.template_hostname = provider.get(
                 'template-hostname',
-                '{image.name}-{timestamp}.template.openstack.org'
+                'template-{image.name}-{timestamp}'
             )
             p.image_type = provider.get('image-type', 'qcow2')
             p.images = {}
@@ -2356,6 +2356,14 @@ class NodePool(threading.Thread):
             if not t.isAlive():
                 del self._delete_threads[k]
 
+        for k, t in self._image_delete_threads.items()[:]:
+            if not t.isAlive():
+                del self._image_delete_threads[k]
+
+        for k, t in self._instance_delete_threads.items()[:]:
+            if not t.isAlive():
+                del self._instance_delete_threads[k]
+
         node_ids = []
         image_ids = []
         dib_image_ids = []
@@ -2406,10 +2414,10 @@ class NodePool(threading.Thread):
 
     def cleanupLeakedInstances(self):
         known_providers = self.config.providers.keys()
-        with self.getDB().getSession() as session:
-            for provider in self.config.providers.values():
-                manager = self.getProviderManager(provider)
-                servers = manager.listServers()
+        for provider in self.config.providers.values():
+            manager = self.getProviderManager(provider)
+            servers = manager.listServers()
+            with self.getDB().getSession() as session:
                 for server in servers:
                     meta = server.get('metadata', {}).get('nodepool')
                     if not meta:
@@ -2432,7 +2440,7 @@ class NodePool(threading.Thread):
                         if session.getSnapshotImage(snap_image_id):
                             continue
                         self.log.warning("Deleting leaked instance %s (%s) "
-                                         "in %s for snapshot image id %s" % (
+                                         "in %s for snapshot image id: %s" % (
                                              server['name'], server['id'],
                                              provider.name,
                                              snap_image_id))
@@ -2441,7 +2449,7 @@ class NodePool(threading.Thread):
                         if session.getNode(node_id):
                             continue
                         self.log.warning("Deleting leaked instance %s (%s) "
-                                         "in %s for node id %s " % (
+                                         "in %s for node id: %s" % (
                                              server['name'], server['id'],
                                              provider.name, node_id))
                         self.deleteInstance(provider.name, server['id'])
