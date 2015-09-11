@@ -75,7 +75,8 @@ def _cloudKwargsFromProvider(provider):
         cloud_kwargs['compute-service-name'] = provider['service-name']
 
     auth_kwargs = {}
-    for auth_key in ('username', 'password', 'auth-url', 'project-id'):
+    for auth_key in (
+            'username', 'password', 'auth-url', 'project-id', 'project-name'):
         if auth_key in provider:
             auth_kwargs[auth_key] = provider[auth_key]
 
@@ -345,8 +346,8 @@ class InstanceDeleter(threading.Thread):
             self.nodepool._deleteInstance(self.provider_name,
                                           self.external_id)
         except Exception:
-            self.log.exception("Exception deleting node %s:" %
-                               self.node_id)
+            self.log.exception("Exception deleting instance %s from %s:" %
+                               (self.external_id, self.provider_name))
 
 
 class NodeDeleter(threading.Thread):

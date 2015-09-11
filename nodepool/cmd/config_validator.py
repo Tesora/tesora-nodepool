@@ -55,6 +55,7 @@ class ConfigValidator:
             'password': str,
             'auth-url': str,
             'project-id': str,
+            'project-name': str,
             'max-servers': int,
             'pool': str,
             'image-type': str,
@@ -106,7 +107,8 @@ class ConfigValidator:
             'dburi': str,
             'zmq-publishers': [str],
             'gearman-servers': [{
-                'host': str
+                'host': str,
+                'port': int,
             }],
             'cron': cron,
             'providers': [providers],
