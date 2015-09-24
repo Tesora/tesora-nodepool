@@ -1192,7 +1192,7 @@ class SnapshotImageUpdater(ImageUpdater):
         # /etc/nodepool is world writable because by the time we write
         # the contents after the node is launched, we may not have
         # sudo access any more.
-        host.ssh("make config dir", "sudo mkdir /etc/nodepool")
+        host.ssh("make config dir", "sudo mkdir -p /etc/nodepool")
         host.ssh("chmod config dir", "sudo chmod 0777 /etc/nodepool")
         for fname in os.listdir(self.scriptdir):
             path = os.path.join(self.scriptdir, fname)
@@ -1932,7 +1932,7 @@ class NodePool(threading.Thread):
     def checkForMissingDiskImage(self, session, provider, image):
         found = False
         for dib_image in session.getDibImages():
-            if dib_image.image_name != image.name:
+            if dib_image.image_name != image.diskimage:
                 continue
             if dib_image.state != nodedb.READY:
                 # This is either building or in an error state
@@ -2072,8 +2072,9 @@ class NodePool(threading.Thread):
         with self.getDB().getSession() as session:
             queued_images = session.getBuildingDibImagesByName(image.name)
             if queued_images:
-                self.log.exception('Image %s is already being built' %
-                                   image.name)
+                self.log.error('Image %s is already being built' %
+                               image.name)
+                return
             else:
                 try:
                     start_time = time.time()
@@ -2095,7 +2096,9 @@ class NodePool(threading.Thread):
                         "Could not build image %s", image.name)
 
     def uploadImage(self, session, provider, image_name):
-        images = session.getOrderedReadyDibImages(image_name)
+        provider_entity = self.config.providers[provider]
+        provider_image = provider_entity.images[image_name]
+        images = session.getOrderedReadyDibImages(provider_image.diskimage)
         if not images:
             # raise error, no image ready for uploading
             raise Exception(
@@ -2103,11 +2106,10 @@ class NodePool(threading.Thread):
 
         try:
             filename = images[0].filename
-            provider_entity = self.config.providers[provider]
-            provider_image = provider_entity.images[images[0].image_name]
+
             image_type = provider_entity.image_type
             snap_image = session.createSnapshotImage(
-                provider_name=provider, image_name=image_name)
+                provider_name=provider, image_name=provider_image.name)
             t = DiskImageUpdater(self, provider_entity, provider_image,
                                  snap_image.id, filename, image_type)
             t.start()
