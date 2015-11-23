@@ -17,10 +17,23 @@
 NODEPOOL_KEY=$HOME/.ssh/id_nodepool
 NODEPOOL_PUBKEY=$HOME/.ssh/id_nodepool.pub
 
+# Install shade from git if requested. If not requested
+# nodepool install will pull it in.
+function install_shade {
+    if use_library_from_git "shade"; then
+        GITREPO["shade"]=$SHADE_REPO_URL
+        GITDIR["shade"]=$DEST/shade
+        GITBRANCH["shade"]=$SHADE_REPO_REF
+        git_clone_by_name "shade"
+        setup_dev_lib "shade"
+    fi
+}
+
 # Install nodepool code
 function install_nodepool {
     # This function is currently blank because just installing a git
     # tree does not require any additional code
+    install_shade
     setup_develop $DEST/nodepool
 }
 
@@ -68,15 +81,15 @@ EOF
         $(dirname $NODEPOOL_CONFIG)/elements/nodepool-setup/install.d/01-nodepool-setup
     sudo chmod a+x \
         $(dirname $NODEPOOL_CONFIG)/elements/nodepool-setup/install.d/01-nodepool-setup
-    sudo mkdir -p $(dirname $NODEPOOL_CONFIG)/images
-    sudo mkdir -p /opt/dib/tmp
-    sudo mkdir -p /opt/dib/cache
-    sudo chown stack:stack $(dirname $NODEPOOL_CONFIG)/images
-    sudo chown -R stack:stack /opt/dib
+    sudo mkdir -p $NODEPOOL_DIB_BASE_PATH/images
+    sudo mkdir -p $NODEPOOL_DIB_BASE_PATH/tmp
+    sudo mkdir -p $NODEPOOL_DIB_BASE_PATH/cache
+    sudo chown -R stack:stack $NODEPOOL_DIB_BASE_PATH
 }
 
 function nodepool_write_config {
     sudo mkdir -p $(dirname $NODEPOOL_CONFIG)
+    sudo mkdir -p $(dirname $NODEPOOL_SECURE)
     local dburi=$(database_connection_url nodepool)
 
     cat > /tmp/logging.conf <<EOF
@@ -111,13 +124,23 @@ EOF
 
     sudo mv /tmp/logging.conf $NODEPOOL_LOGGING
 
+    cat > /tmp/secure.conf << EOF
+[database]
+# The mysql password here may be different depending on your
+# devstack install, you should double check it (the devstack var
+# is MYSQL_PASSWORD and if unset devstack should prompt you for
+# the value).
+dburi: $dburi
+EOF
+    sudo mv /tmp/secure.conf $NODEPOOL_SECURE
+
     cat > /tmp/nodepool.yaml <<EOF
 # You will need to make and populate these two paths as necessary,
 # cloning nodepool does not do this. Further in this doc we have an
 # example script for /path/to/nodepool/things/scripts.
 script-dir: $(dirname $NODEPOOL_CONFIG)/scripts
 elements-dir: $(dirname $NODEPOOL_CONFIG)/elements
-images-dir: $(dirname $NODEPOOL_CONFIG)/images
+images-dir: $NODEPOOL_DIB_BASE_PATH/images
 # The mysql password here may be different depending on your
 # devstack install, you should double check it (the devstack var
 # is MYSQL_PASSWORD and if unset devstack should prompt you for
@@ -157,11 +180,7 @@ labels:
 providers:
   - name: devstack
     region-name: '$REGION_NAME'
-    service-type: 'compute'
-    username: 'demo'
-    project-name: 'demo'
-    password: '$ADMIN_PASSWORD'
-    auth-url: '$KEYSTONE_AUTH_URI/v$IDENTITY_API_VERSION'
+    cloud: devstack
     api-timeout: 60
     # Long boot timeout to deal with potentially nested virt.
     boot-timeout: 600
@@ -196,8 +215,8 @@ diskimages:
       - nodepool-setup
     release: trusty
     env-vars:
-      TMPDIR: /opt/dib/tmp
-      DIB_IMAGE_CACHE: /opt/dib/cache
+      TMPDIR: $NODEPOOL_DIB_BASE_PATH/tmp
+      DIB_IMAGE_CACHE: $NODEPOOL_DIB_BASE_PATH/cache
       DIB_APT_LOCAL_CACHE: '0'
       DIB_DISABLE_APT_CLEANUP: '1'
       DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
@@ -243,7 +262,7 @@ function start_nodepool {
     # start gearman server
     run_process geard "geard -p 8991 -d"
 
-    run_process nodepool "nodepoold -c $NODEPOOL_CONFIG -l $NODEPOOL_LOGGING -d"
+    run_process nodepool "nodepoold -c $NODEPOOL_CONFIG -s $NODEPOOL_SECURE -l $NODEPOOL_LOGGING -d"
     :
 }
 

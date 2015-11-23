@@ -90,6 +90,7 @@ class ConfigValidator:
                 'user': str,
                 'apikey': str,
                 'credentials-id': str,
+                'test-job': str
             }
         }
 

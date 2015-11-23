@@ -46,6 +46,9 @@ class NodePoolCmd(object):
         parser.add_argument('-c', dest='config',
                             default='/etc/nodepool/nodepool.yaml',
                             help='path to config file')
+        parser.add_argument('-s', dest='secure',
+                            default='/etc/nodepool/secure.conf',
+                            help='path to secure file')
         parser.add_argument('--version', action='version',
                             version=npc_version_info.version_string(),
                             help='show version')
@@ -193,6 +196,8 @@ class NodePoolCmd(object):
             print t
 
     def image_update(self):
+        threads = []
+
         with self.pool.getDB().getSession() as session:
             self.pool.reconfigureManagers(self.pool.config)
             if self.args.image not in self.pool.config.images_in_use:
@@ -200,18 +205,18 @@ class NodePoolCmd(object):
                                 % self.args.image)
 
             if self.args.provider == 'all':
-                dib_image_built = False
+                dib_images_built = set()
                 for provider in self.pool.config.providers.values():
                     image = provider.images.get(self.args.image)
                     if image and image.diskimage:
-                        if not dib_image_built:
-                            self.image_build()
-                            dib_image_built = True
-                        self.pool.uploadImage(session, provider.name,
-                                              image.name)
+                        if image.diskimage not in dib_images_built:
+                            self.image_build(image.diskimage)
+                            dib_images_built.add(image.diskimage)
+                        threads.append(self.pool.uploadImage(
+                            session, provider.name, image.name))
                     elif image:
-                        self.pool.updateImage(session, provider.name,
-                                              image.name)
+                        threads.append(self.pool.updateImage(
+                            session, provider.name, image.name))
             else:
                 provider = self.pool.config.providers.get(self.args.provider)
                 if not provider:
@@ -219,43 +224,56 @@ class NodePoolCmd(object):
                                     % self.args.provider)
                 image = provider.images.get(self.args.image)
                 if image and image.diskimage:
-                    self.image_build()
-                    self.pool.uploadImage(session, provider.name, image.name)
+                    self.image_build(image.diskimage)
+                    threads.append(self.pool.uploadImage(
+                        session, provider.name, image.name))
                 elif image:
-                    self.pool.updateImage(session, provider.name, image.name)
+                    threads.append(self.pool.updateImage(
+                        session, provider.name, image.name))
                 else:
                     raise Exception("Image %s not in use by provider %s"
                                     % (self.args.image, self.args.provider))
 
-    def image_build(self):
-        if self.args.image not in self.pool.config.diskimages:
+        self._wait_for_threads(threads)
+
+    def image_build(self, diskimage=None):
+        diskimage = diskimage or self.args.image
+        if diskimage not in self.pool.config.diskimages:
             # only can build disk images, not snapshots
             raise Exception("Trying to build a non disk-image-builder "
-                            "image: %s" % self.args.image)
+                            "image: %s" % diskimage)
 
         self.pool.reconfigureImageBuilder()
-        self.pool.buildImage(self.pool.config.diskimages[self.args.image])
+        self.pool.buildImage(self.pool.config.diskimages[diskimage])
         self.pool.waitForBuiltImages()
 
     def image_upload(self):
         self.pool.reconfigureManagers(self.pool.config, False)
-        if not self.args.image in self.pool.config.diskimages:
-            # only can build disk images, not snapshots
-            raise Exception("Trying to upload a non disk-image-builder "
-                            "image: %s" % self.args.image)
+
+        threads = []
 
         with self.pool.getDB().getSession() as session:
             if self.args.provider == 'all':
                 # iterate for all providers listed in label
                 for provider in self.pool.config.providers.values():
-                    for image in provider.images.values():
-                        if self.args.image == image.name:
-                            self.pool.uploadImage(session, provider.name,
-                                                  self.args.image)
-                            break
+                    image = provider.images[self.args.image]
+                    if not image.diskimage:
+                        self.log.warning("Trying to upload a non "
+                                         "disk-image-builder image: %s",
+                                         self.args.image)
+                    else:
+                        threads.append(self.pool.uploadImage(
+                            session, provider.name, self.args.image))
             else:
-                self.pool.uploadImage(session, self.args.provider,
-                                      self.args.image)
+                provider = self.pool.config.providers[self.args.provider]
+                if not provider.images[self.args.image].diskimage:
+                    raise Exception("Trying to upload a non "
+                                    "disk-image-builder image: %s",
+                                    self.args.image)
+                threads.append(self.pool.uploadImage(
+                    session, self.args.provider, self.args.image))
+
+        self._wait_for_threads(threads)
 
     def alien_list(self):
         self.pool.reconfigureManagers(self.pool.config, False)
@@ -336,19 +354,26 @@ class NodePoolCmd(object):
 
     def image_delete(self):
         self.pool.reconfigureManagers(self.pool.config, False)
-        self.pool.deleteImage(self.args.id)
+        thread = self.pool.deleteImage(self.args.id)
+        self._wait_for_threads((thread, ))
 
     def config_validate(self):
         validator = ConfigValidator(self.args.config)
         validator.validate()
         log.info("Configuation validation complete")
+        #TODO(asselin,yolanda): add validation of secure.conf
+
+    def _wait_for_threads(self, threads):
+        for t in threads:
+            if t:
+                t.join()
 
     def main(self):
         # commands which do not need to start-up or parse config
         if self.args.command in ('config-validate'):
             return self.args.func()
 
-        self.pool = nodepool.NodePool(self.args.config)
+        self.pool = nodepool.NodePool(self.args.secure, self.args.config)
         config = self.pool.loadConfig()
         self.pool.reconfigureDatabase(config)
         self.pool.setConfig(config)

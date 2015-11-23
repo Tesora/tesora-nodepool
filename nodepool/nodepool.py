@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from six.moves import configparser as ConfigParser
 import apscheduler.scheduler
 import gear
 import json
@@ -856,8 +857,10 @@ class DiskImageBuilder(threading.Thread):
         # Note we use a reference to the nodepool config here so
         # that whenever the config is updated we get up to date
         # values in this thread.
-        env['ELEMENTS_PATH'] = self.nodepool.config.elementsdir
-        env['NODEPOOL_SCRIPTDIR'] = self.nodepool.config.scriptdir
+        if self.nodepool.config.elementsdir:
+            env['ELEMENTS_PATH'] = self.nodepool.config.elementsdir
+        if self.nodepool.config.scriptdir:
+            env['NODEPOOL_SCRIPTDIR'] = self.nodepool.config.scriptdir
 
         # send additional env vars if needed
         for k, v in image.env_vars.items():
@@ -1175,7 +1178,8 @@ class SnapshotImageUpdater(ImageUpdater):
             # We have connected to the node but couldn't do anything as root
             # try distro specific users, since we know ssh is up (a timeout
             # didn't occur), we can connect with a very sort timeout.
-            for username in ['ubuntu', 'fedora', 'cloud-user', 'centos']:
+            for username in ['ubuntu', 'fedora', 'cloud-user', 'centos',
+                             'debian']:
                 try:
                     host = utils.ssh_connect(server['public_ip'], username,
                                              ssh_kwargs,
@@ -1188,21 +1192,23 @@ class SnapshotImageUpdater(ImageUpdater):
         if not host:
             raise Exception("Unable to log in via SSH")
 
-        host.ssh("make scripts dir", "mkdir -p scripts")
         # /etc/nodepool is world writable because by the time we write
         # the contents after the node is launched, we may not have
         # sudo access any more.
         host.ssh("make config dir", "sudo mkdir -p /etc/nodepool")
         host.ssh("chmod config dir", "sudo chmod 0777 /etc/nodepool")
-        for fname in os.listdir(self.scriptdir):
-            path = os.path.join(self.scriptdir, fname)
-            if not os.path.isfile(path):
-                continue
-            host.scp(path, 'scripts/%s' % fname)
-        host.ssh("move scripts to opt",
-                 "sudo mv scripts /opt/nodepool-scripts")
-        host.ssh("set scripts permissions",
-                 "sudo chmod -R a+rx /opt/nodepool-scripts")
+        if self.scriptdir:
+            host.ssh("make scripts dir", "mkdir -p scripts")
+            for fname in os.listdir(self.scriptdir):
+                path = os.path.join(self.scriptdir, fname)
+                if not os.path.isfile(path):
+                    continue
+                host.scp(path, 'scripts/%s' % fname)
+            host.ssh("move scripts to opt",
+                     "sudo mv scripts /opt/nodepool-scripts")
+            host.ssh("set scripts permissions",
+                     "sudo chmod -R a+rx /opt/nodepool-scripts")
+
         if self.image.setup:
             env_vars = ''
             for k, v in os.environ.items():
@@ -1217,7 +1223,8 @@ class SnapshotImageUpdater(ImageUpdater):
                        "/usr/local/sbin:/sbin:/usr/sbin:" \
                        "/usr/local/bin:/bin:/usr/bin"
             host.ssh("run setup script",
-                     "%s; cd /opt/nodepool-scripts && %s ./%s %s" %
+                     "%s; cd /opt/nodepool-scripts "
+                     "&& %s ./%s %s && sync && sleep 5" %
                      (set_path, env_vars, self.image.setup, server['name']))
 
 
@@ -1268,8 +1275,10 @@ class DiskImage(ConfigValue):
 class NodePool(threading.Thread):
     log = logging.getLogger("nodepool.NodePool")
 
-    def __init__(self, configfile, watermark_sleep=WATERMARK_SLEEP):
+    def __init__(self, securefile, configfile,
+                 watermark_sleep=WATERMARK_SLEEP):
         threading.Thread.__init__(self, name='NodePool')
+        self.securefile = securefile
         self.configfile = configfile
         self.watermark_sleep = watermark_sleep
         self._stopped = False
@@ -1303,6 +1312,8 @@ class NodePool(threading.Thread):
 
     def loadConfig(self):
         self.log.debug("Loading configuration")
+        secure = ConfigParser.ConfigParser()
+        secure.readfp(open(self.securefile))
         config = yaml.load(open(self.configfile))
         cloud_config = os_client_config.OpenStackConfig()
 
@@ -1315,7 +1326,7 @@ class NodePool(threading.Thread):
         newconfig.scriptdir = config.get('script-dir')
         newconfig.elementsdir = config.get('elements-dir')
         newconfig.imagesdir = config.get('images-dir')
-        newconfig.dburi = config.get('dburi')
+        newconfig.dburi = secure.get('database', 'dburi')
         newconfig.provider_managers = {}
         newconfig.jenkins_managers = {}
         newconfig.zmq_publishers = {}
@@ -1446,24 +1457,35 @@ class NodePool(threading.Thread):
                 l.providers[p.name] = p
 
         for target in config['targets']:
+            # look at secure file for that section
+            section_name = 'jenkins "%s"' % target['name']
             t = Target()
             t.name = target['name']
             newconfig.targets[t.name] = t
-            jenkins = target.get('jenkins')
             t.online = True
-            if jenkins:
-                t.jenkins_url = jenkins['url']
-                t.jenkins_user = jenkins['user']
-                t.jenkins_apikey = jenkins['apikey']
-                t.jenkins_credentials_id = jenkins.get('credentials-id')
-                t.jenkins_test_job = jenkins.get('test-job')
+
+            if secure.has_section(section_name):
+                t.jenkins_url = secure.get(section_name, 'url')
+                t.jenkins_user = secure.get(section_name, 'user')
+                t.jenkins_apikey = secure.get(section_name, 'apikey')
             else:
                 t.jenkins_url = None
                 t.jenkins_user = None
                 t.jenkins_apikey = None
-                t.jenkins_credentials_id = None
-                t.jenkins_test_job = None
+
             t.rate = target.get('rate', 1.0)
+            try:
+                t.jenkins_credentials_id = secure.get(
+                    section_name, 'credentials')
+            except:
+                t.jenkins_credentials_id = None
+
+            jenkins = target.get('jenkins')
+            if jenkins:
+                t.jenkins_test_job = jenkins.get('test-job', None)
+            else:
+                t.jenkins_test_job = None
+
             t.hostname = target.get(
                 'hostname',
                 '{label.name}-{provider.name}-{node_id}'
@@ -1542,29 +1564,29 @@ class NodePool(threading.Thread):
                     provider_manager.ProviderManager(p)
                 config.provider_managers[p.name].start()
 
+        for t in config.targets.values():
+            oldmanager = None
+            if self.config:
+                oldmanager = self.config.jenkins_managers.get(t.name)
+            if oldmanager:
+                if (t.jenkins_url != oldmanager.target.jenkins_url or
+                    t.jenkins_user != oldmanager.target.jenkins_user or
+                    t.jenkins_apikey != oldmanager.target.jenkins_apikey):
+                    stop_managers.append(oldmanager)
+                    oldmanager = None
+            if oldmanager:
+                config.jenkins_managers[t.name] = oldmanager
+            elif t.jenkins_url:
+                self.log.debug("Creating new JenkinsManager object "
+                               "for %s" % t.name)
+                config.jenkins_managers[t.name] = \
+                    jenkins_manager.JenkinsManager(t)
+                config.jenkins_managers[t.name].start()
+        for oldmanager in stop_managers:
+            oldmanager.stop()
+
         # only do it if we need to check for targets
         if check_targets:
-            for t in config.targets.values():
-                oldmanager = None
-                if self.config:
-                    oldmanager = self.config.jenkins_managers.get(t.name)
-                if oldmanager:
-                    if (t.jenkins_url != oldmanager.target.jenkins_url or
-                        t.jenkins_user != oldmanager.target.jenkins_user or
-                        t.jenkins_apikey != oldmanager.target.jenkins_apikey):
-                        stop_managers.append(oldmanager)
-                        oldmanager = None
-                if oldmanager:
-                    config.jenkins_managers[t.name] = oldmanager
-                elif t.jenkins_url:
-                    self.log.debug("Creating new JenkinsManager object "
-                                   "for %s" % t.name)
-                    config.jenkins_managers[t.name] = \
-                        jenkins_manager.JenkinsManager(t)
-                    config.jenkins_managers[t.name].start()
-            for oldmanager in stop_managers:
-                oldmanager.stop()
-
             for t in config.targets.values():
                 if t.jenkins_url:
                     try:
@@ -1742,7 +1764,8 @@ class NodePool(threading.Thread):
 
             capacity = 0
             for provider in label.providers.values():
-                capacity += allocation_providers[provider.name].available
+                if provider.name in allocation_providers:
+                    capacity += allocation_providers[provider.name].available
 
             # Note actual_demand and extra_demand are written this way
             # because max(0, x - y + z) != max(0, x - y) + z.
@@ -2038,7 +2061,7 @@ class NodePool(threading.Thread):
 
     def updateImage(self, session, provider_name, image_name):
         try:
-            self._updateImage(session, provider_name, image_name)
+            return self._updateImage(session, provider_name, image_name)
         except Exception:
             self.log.exception(
                 "Could not update image %s on %s", image_name, provider_name)
@@ -2198,58 +2221,75 @@ class NodePool(threading.Thread):
             # Don't write to the session if not needed.
             node.state = nodedb.DELETE
         self.updateStats(session, node.provider_name)
-        provider = self.config.providers[node.provider_name]
-        target = self.config.targets[node.target_name]
-        label = self.config.labels.get(node.label_name, None)
-        if label:
-            image_name = provider.images[label.image].name
-        else:
-            image_name = None
-        manager = self.getProviderManager(provider)
 
-        if target.jenkins_url and (node.nodename is not None):
+        # remove node from jenkins
+        target = self.config.targets[node.target_name]
+        if target and target.jenkins_url and (node.nodename is not None):
             jenkins = self.getJenkinsManager(target)
             jenkins_name = node.nodename
             if jenkins.nodeExists(jenkins_name):
                 jenkins.deleteNode(jenkins_name)
             self.log.info("Deleted jenkins node id: %s" % node.id)
 
-        for subnode in node.subnodes:
-            if subnode.external_id:
+        # remove node from cloud
+        try:
+            provider = self.config.providers[node.provider_name]
+        except:
+            # In this case, provider is not found on nodepool.yaml, maybe
+            # because of an incorrect worflow followed to remove from settings.
+            # But there are still pending nodes to be deleted, pointing to that
+            # provider, so we will continue with the removal process
+            # (from jenkins and from database)
+            self.log.warning("Provider %s not found" % node.provider_name)
+            provider = None
+        if provider:
+            manager = self.getProviderManager(provider)
+            for subnode in node.subnodes:
+                if subnode.external_id:
+                    try:
+                        self.log.debug('Deleting server %s for subnode id: '
+                                       '%s of node id: %s' %
+                                       (subnode.external_id, subnode.id,
+                                        node.id))
+                        manager.cleanupServer(subnode.external_id)
+                    except provider_manager.NotFound:
+                        pass
+
+            if node.external_id:
                 try:
-                    self.log.debug('Deleting server %s for subnode id: '
-                                   '%s of node id: %s' %
-                                   (subnode.external_id, subnode.id, node.id))
-                    manager.cleanupServer(subnode.external_id)
+                    self.log.debug('Deleting server %s for node id: %s' %
+                                   (node.external_id, node.id))
+                    manager.cleanupServer(node.external_id)
+                    manager.waitForServerDeletion(node.external_id)
                 except provider_manager.NotFound:
                     pass
-
-        if node.external_id:
-            try:
-                self.log.debug('Deleting server %s for node id: %s' %
-                               (node.external_id, node.id))
-                manager.cleanupServer(node.external_id)
-                manager.waitForServerDeletion(node.external_id)
-            except provider_manager.NotFound:
-                pass
             node.external_id = None
 
+        # remove from database
         for subnode in node.subnodes:
             if subnode.external_id:
-                manager.waitForServerDeletion(subnode.external_id)
+                if manager:
+                    manager.waitForServerDeletion(subnode.external_id)
                 subnode.delete()
-
         node.delete()
         self.log.info("Deleted node id: %s" % node.id)
 
-        if statsd:
-            dt = int((time.time() - node.state_time) * 1000)
-            key = 'nodepool.delete.%s.%s.%s' % (image_name,
-                                                node.provider_name,
-                                                node.target_name)
-            statsd.timing(key, dt)
-            statsd.incr(key)
-        self.updateStats(session, node.provider_name)
+        if provider:
+            if statsd:
+                # update stats
+                label = self.config.labels.get(node.label_name, None)
+                if label and provider and label.image in provider.images:
+                    image_name = provider.images[label.image].name
+                else:
+                    image_name = None
+
+                dt = int((time.time() - node.state_time) * 1000)
+                key = 'nodepool.delete.%s.%s.%s' % (image_name,
+                                                    node.provider_name,
+                                                    node.target_name)
+                statsd.timing(key, dt)
+                statsd.incr(key)
+            self.updateStats(session, node.provider_name)
 
     def deleteImage(self, snap_image_id):
         try:
@@ -2267,6 +2307,7 @@ class NodePool(threading.Thread):
             t = ImageDeleter(self, snap_image_id)
             self._image_delete_threads[snap_image_id] = t
             t.start()
+            return t
         except Exception:
             self.log.exception("Could not delete image %s", snap_image_id)
         finally:
@@ -2580,43 +2621,43 @@ class NodePool(threading.Thread):
         if not statsd:
             return
         # This may be called outside of the main thread.
+        if provider_name not in self.config.providers:
+            return
+
         provider = self.config.providers[provider_name]
 
         states = {}
 
-        #nodepool.target.TARGET.LABEL.min_ready
-        #nodepool.target.TARGET.LABEL.PROVIDER.STATE
-        #nodepool.target.STATE
-        base_key = 'nodepool.target'
-        for target in self.config.targets.values():
-            target_key = '%s.%s' % (base_key, target.name)
+        #nodepool.nodes.STATE
+        #nodepool.target.TARGET.nodes.STATE
+        #nodepool.label.LABEL.nodes.STATE
+
+        for state in nodedb.STATE_NAMES.values():
+            key = 'nodepool.nodes.%s' % state
+            states[key] = 0
+            for target in self.config.targets.values():
+                key = 'nodepool.target.%s.nodes.%s' % (
+                    target.name, state)
+                states[key] = 0
             for label in self.config.labels.values():
-                label_key = '%s.%s' % (target_key, label.name)
-                key = '%s.min_ready' % label_key
-                statsd.gauge(key, label.min_ready)
-                for provider in label.providers.values():
-                    provider_key = '%s.%s' % (label_key, provider.name)
-                    for state in nodedb.STATE_NAMES.values():
-                        base_state_key = '%s.%s' % (base_key, state)
-                        provider_state_key = '%s.%s' % (provider_key, state)
-                        for key in [base_state_key, provider_state_key]:
-                            states[key] = 0
+                key = 'nodepool.label.%s.nodes.%s' % (
+                    label.name, state)
+                states[key] = 0
 
         for node in session.getNodes():
             if node.state not in nodedb.STATE_NAMES:
                 continue
             state = nodedb.STATE_NAMES[node.state]
-            target_key = '%s.%s' % (base_key, node.target_name)
-            label_key = '%s.%s' % (target_key, node.label_name)
-            provider_key = '%s.%s' % (label_key, node.provider_name)
+            key = 'nodepool.nodes.%s' % state
+            states[key] += 1
 
-            base_state_key = '%s.%s' % (base_key, state)
-            provider_state_key = '%s.%s' % (provider_key, state)
+            key = 'nodepool.target.%s.nodes.%s' % (
+                node.target_name, state)
+            states[key] += 1
 
-            for key in [base_state_key, provider_state_key]:
-                if key not in states:
-                    states[key] = 0
-                states[key] += 1
+            key = 'nodepool.label.%s.nodes.%s' % (
+                node.label_name, state)
+            states[key] += 1
 
         for key, count in states.items():
             statsd.gauge(key, count)
