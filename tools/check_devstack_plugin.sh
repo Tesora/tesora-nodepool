@@ -1,18 +1,19 @@
 #!/bin/bash -x
 
 NODEPOOL_CONFIG=${NODEPOOL_CONFIG:-/etc/nodepool/nodepool.yaml}
-NODEPOOL="nodepool -c $NODEPOOL_CONFIG"
+NODEPOOL_SECURE=${NODEPOOL_SECURE:-/etc/nodepool/secure.conf}
+NODEPOOL="nodepool -c $NODEPOOL_CONFIG -s $NODEPOOL_SECURE"
 
 function waitforimage {
     name=$1
     state='ready'
 
     while ! $NODEPOOL image-list | grep $name | grep $state; do
-	$NODEPOOL image-list > /tmp/.nodepool-image-list.txt
-	$NODEPOOL list > /tmp/.nodepool-list.txt
-	sudo mv /tmp/.nodepool-image-list.txt $WORKSPACE/logs/nodepool-image-list.txt
-	sudo mv /tmp/.nodepool-list.txt $WORKSPACE/logs/nodepool-list.txt
-	sleep 10
+        $NODEPOOL image-list > /tmp/.nodepool-image-list.txt
+        $NODEPOOL list > /tmp/.nodepool-list.txt
+        sudo mv /tmp/.nodepool-image-list.txt $WORKSPACE/logs/nodepool-image-list.txt
+        sudo mv /tmp/.nodepool-list.txt $WORKSPACE/logs/nodepool-list.txt
+        sleep 10
     done
 }
 
@@ -21,11 +22,11 @@ function waitfornode {
     state='ready'
 
     while ! $NODEPOOL list | grep $name | grep $state; do
-	$NODEPOOL image-list > /tmp/.nodepool-image-list.txt
-	$NODEPOOL list > /tmp/.nodepool-list.txt
-	sudo mv /tmp/.nodepool-image-list.txt $WORKSPACE/logs/nodepool-image-list.txt
-	sudo mv /tmp/.nodepool-list.txt $WORKSPACE/logs/nodepool-list.txt
-	sleep 10
+        $NODEPOOL image-list > /tmp/.nodepool-image-list.txt
+        $NODEPOOL list > /tmp/.nodepool-list.txt
+        sudo mv /tmp/.nodepool-image-list.txt $WORKSPACE/logs/nodepool-image-list.txt
+        sudo mv /tmp/.nodepool-list.txt $WORKSPACE/logs/nodepool-list.txt
+        sleep 10
     done
 }
 

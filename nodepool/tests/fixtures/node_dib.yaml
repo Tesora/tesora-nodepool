@@ -2,8 +2,6 @@ script-dir: .
 elements-dir: .
 images-dir: '{images_dir}'
 
-dburi: '{dburi}'
-
 cron:
   check: '*/15 * * * *'
   cleanup: '*/1 * * * *'
@@ -39,17 +37,13 @@ providers:
       - name: fake-dib-image
         base-image: 'Fake Precise'
         min-ram: 8192
-        diskimage: fake-dib-image
+        diskimage: fake-dib-diskimage
 
 targets:
   - name: fake-target
-    jenkins:
-      url: https://jenkins.example.org/
-      user: fake
-      apikey: fake
 
 diskimages:
-  - name: fake-dib-image
+  - name: fake-dib-diskimage
     elements:
       - fedora
       - vm
