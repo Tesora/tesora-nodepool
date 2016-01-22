@@ -16,23 +16,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from six.moves import configparser as ConfigParser
-import apscheduler.scheduler
+import apscheduler.schedulers.background
+import apscheduler.triggers.cron
 import gear
 import json
 import logging
-import os_client_config
 import os.path
 import paramiko
 import pprint
-import Queue
 import random
 import re
-import shlex
-import subprocess
 import threading
 import time
-import yaml
+from uuid import uuid4
 import zmq
 
 import allocation
@@ -40,7 +36,9 @@ import jenkins_manager
 import nodedb
 import nodeutils as utils
 import provider_manager
-from stats import statsd
+import stats
+import config as nodepool_config
+
 
 MINS = 60
 HOURS = 60 * MINS
@@ -56,38 +54,6 @@ IMAGE_CLEANUP = 8 * HOURS    # When to start deleting an image that is not
                              # READY or is not the current or previous image
 DELETE_DELAY = 1 * MINS      # Delay before deleting a node that has completed
                              # its job.
-
-# HP Cloud requires qemu compat with 0.10. That version works elsewhere,
-# so just hardcode it for all qcow2 building
-DEFAULT_QEMU_IMAGE_COMPAT_OPTIONS = "--qemu-img-options 'compat=0.10'"
-
-
-def _cloudKwargsFromProvider(provider):
-    cloud_kwargs = {}
-    for arg in ['region-name', 'api-timeout', 'cloud']:
-        if arg in provider:
-            cloud_kwargs[arg] = provider[arg]
-
-    # These are named from back when we only talked to Nova. They're
-    # actually compute service related
-    if 'service-type' in provider:
-        cloud_kwargs['compute-service-type'] = provider['service-type']
-    if 'service-name' in provider:
-        cloud_kwargs['compute-service-name'] = provider['service-name']
-
-    auth_kwargs = {}
-    for auth_key in (
-            'username', 'password', 'auth-url', 'project-id', 'project-name'):
-        if auth_key in provider:
-            auth_kwargs[auth_key] = provider[auth_key]
-
-    cloud_kwargs['auth'] = auth_kwargs
-    return cloud_kwargs
-
-
-def _get_one_cloud(cloud_config, cloud_kwargs):
-    '''This is a function to allow for overriding it in tests.'''
-    return cloud_config.get_one_cloud(**cloud_kwargs)
 
 
 class LaunchNodepoolException(Exception):
@@ -117,6 +83,7 @@ class NodeCompleteThread(threading.Thread):
         self.jobname = jobname
         self.result = result
         self.branch = branch
+        self.statsd = stats.get_client()
 
     def run(self):
         try:
@@ -156,29 +123,29 @@ class NodeCompleteThread(threading.Thread):
             self.log.info("Node id: %s failed acceptance test, deleting" %
                           node.id)
 
-        if statsd and self.result == 'SUCCESS':
+        if self.statsd and self.result == 'SUCCESS':
             start = node.state_time
             dt = int((time.time() - start) * 1000)
 
             # nodepool.job.tempest
             key = 'nodepool.job.%s' % self.jobname
-            statsd.timing(key + '.runtime', dt)
-            statsd.incr(key + '.builds')
+            self.statsd.timing(key + '.runtime', dt)
+            self.statsd.incr(key + '.builds')
 
             # nodepool.job.tempest.master
             key += '.%s' % self.branch
-            statsd.timing(key + '.runtime', dt)
-            statsd.incr(key + '.builds')
+            self.statsd.timing(key + '.runtime', dt)
+            self.statsd.incr(key + '.builds')
 
             # nodepool.job.tempest.master.devstack-precise
             key += '.%s' % node.label_name
-            statsd.timing(key + '.runtime', dt)
-            statsd.incr(key + '.builds')
+            self.statsd.timing(key + '.runtime', dt)
+            self.statsd.incr(key + '.builds')
 
             # nodepool.job.tempest.master.devstack-precise.rax-ord
             key += '.%s' % node.provider_name
-            statsd.timing(key + '.runtime', dt)
-            statsd.incr(key + '.builds')
+            self.statsd.timing(key + '.runtime', dt)
+            self.statsd.incr(key + '.builds')
 
         time.sleep(DELETE_DELAY)
         self.nodepool.deleteNode(node.id)
@@ -261,6 +228,48 @@ class NodeUpdateListener(threading.Thread):
         t.start()
 
 
+class WatchableJob(gear.Job):
+    def __init__(self, *args, **kwargs):
+        super(WatchableJob, self).__init__(*args, **kwargs)
+        self._completion_handlers = []
+        self._failure_handlers = []
+        self._event = threading.Event()
+
+    def addCompletionHandler(self, handler, *args, **kwargs):
+        self._completion_handlers.append((handler, args, kwargs))
+
+    def addFailureHandler(self, handler, *args, **kwargs):
+        self._failure_handlers.append((handler, args, kwargs))
+
+    def onCompleted(self):
+        for handler, args, kwargs in self._completion_handlers:
+            handler(self, *args, **kwargs)
+
+        self._event.set()
+
+    def onFailed(self):
+        for handler, args, kwargs in self._failure_handlers:
+            handler(self, *args, **kwargs)
+
+        self._event.set()
+
+    def waitForCompletion(self, timeout=None):
+        return self._event.wait(timeout)
+
+
+class JobTracker(object):
+    def __init__(self):
+        self._running_jobs = set()
+
+    @property
+    def running_jobs(self):
+        return list(self._running_jobs)
+
+    def addJob(self, job):
+        self._running_jobs.add(job)
+        job.addCompletionHandler(self._running_jobs.remove)
+
+
 class GearmanClient(gear.Client):
     def __init__(self):
         super(GearmanClient, self).__init__(client_id='nodepool')
@@ -330,6 +339,18 @@ class GearmanClient(gear.Client):
             needed_workers[worker] = (needed_workers.get(worker, 0) +
                                       queued)
         return needed_workers
+
+    def handleWorkComplete(self, packet):
+        job = super(GearmanClient, self).handleWorkComplete(packet)
+        job.onCompleted()
+
+    def handleWorkFail(self, packet):
+        job = super(GearmanClient, self).handleWorkFail(packet)
+        job.onFailed()
+
+    def handleWorkException(self, packet):
+        job = super(GearmanClient, self).handleWorkException(packet)
+        job.onFailed()
 
 
 class InstanceDeleter(threading.Thread):
@@ -829,124 +850,6 @@ class ImageDeleter(threading.Thread):
                                self.snap_image_id)
 
 
-class DiskImageBuilder(threading.Thread):
-    log = logging.getLogger("nodepool.DiskImageBuilderThread")
-
-    def __init__(self, nodepool):
-        threading.Thread.__init__(self, name='DiskImageBuilder queue')
-        self.nodepool = nodepool
-        self.queue = nodepool._image_builder_queue
-
-    def run(self):
-        while True:
-            # grabs image id from queue
-            image_id = self.queue.get()
-            try:
-                self.buildImage(image_id)
-            except Exception:
-                self.log.exception("Exception attempting DIB build "
-                                   "for image %s:" % (image_id,))
-            finally:
-                self.queue.task_done()
-
-    def _buildImage(self, image, image_name, filename):
-        env = os.environ.copy()
-
-        env['DIB_RELEASE'] = image.release
-        env['DIB_IMAGE_NAME'] = image_name
-        env['DIB_IMAGE_FILENAME'] = filename
-        # Note we use a reference to the nodepool config here so
-        # that whenever the config is updated we get up to date
-        # values in this thread.
-        if self.nodepool.config.elementsdir:
-            env['ELEMENTS_PATH'] = self.nodepool.config.elementsdir
-        if self.nodepool.config.scriptdir:
-            env['NODEPOOL_SCRIPTDIR'] = self.nodepool.config.scriptdir
-
-        # send additional env vars if needed
-        for k, v in image.env_vars.items():
-            env[k] = v
-
-        img_elements = image.elements
-        img_types = ",".join(image.image_types)
-
-        qemu_img_options = ''
-        if 'qcow2' in img_types:
-            qemu_img_options = DEFAULT_QEMU_IMAGE_COMPAT_OPTIONS
-
-        if 'fake-' in filename:
-            dib_cmd = 'nodepool/tests/fake-image-create'
-        else:
-            dib_cmd = 'disk-image-create'
-
-        cmd = ('%s -x -t %s --no-tmpfs %s -o %s %s' %
-               (dib_cmd, img_types, qemu_img_options, filename, img_elements))
-
-        log = logging.getLogger("nodepool.image.build.%s" %
-                                (image_name,))
-
-        self.log.info('Running %s' % cmd)
-
-        try:
-            p = subprocess.Popen(
-                shlex.split(cmd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env)
-        except OSError as e:
-            raise Exception("Failed to exec '%s'. Error: '%s'" %
-                            (cmd, e.strerror))
-
-        while True:
-            ln = p.stdout.readline()
-            log.info(ln.strip())
-            if not ln:
-                break
-
-        p.wait()
-        ret = p.returncode
-        if ret:
-            raise Exception("DIB failed creating %s" % (filename,))
-
-    def buildImage(self, image_id):
-        with self.nodepool.getDB().getSession() as session:
-            self.dib_image = session.getDibImage(image_id)
-            self.log.info("Creating image: %s with filename %s" %
-                          (self.dib_image.image_name, self.dib_image.filename))
-
-            start_time = time.time()
-            timestamp = int(start_time)
-            self.dib_image.version = timestamp
-            session.commit()
-
-            # retrieve image details
-            image_details = \
-                self.nodepool.config.diskimages[self.dib_image.image_name]
-            try:
-                self._buildImage(
-                    image_details,
-                    self.dib_image.image_name,
-                    self.dib_image.filename)
-            except Exception:
-                self.log.exception("Exception building DIB image %s:" %
-                                   (image_id,))
-                # DIB should've cleaned up after itself, just remove this
-                # image from the DB.
-                self.dib_image.delete()
-                return
-
-            self.dib_image.state = nodedb.READY
-            session.commit()
-            self.log.info("DIB image %s with file %s is built" % (
-                image_id, self.dib_image.image_name))
-
-            if statsd:
-                dt = int((time.time() - start_time) * 1000)
-                key = 'nodepool.dib_image_build.%s' % self.dib_image.image_name
-                statsd.timing(key, dt)
-                statsd.incr(key)
-
-
 class ImageUpdater(threading.Thread):
     log = logging.getLogger("nodepool.ImageUpdater")
 
@@ -960,6 +863,7 @@ class ImageUpdater(threading.Thread):
         self.scriptdir = self.nodepool.config.scriptdir
         self.elementsdir = self.nodepool.config.elementsdir
         self.imagesdir = self.nodepool.config.imagesdir
+        self.statsd = stats.get_client()
 
     def run(self):
         try:
@@ -993,58 +897,6 @@ class ImageUpdater(threading.Thread):
                     self.log.exception("Exception deleting image id: %s:" %
                                        self.snap_image.id)
                     return
-
-
-class DiskImageUpdater(ImageUpdater):
-
-    log = logging.getLogger("nodepool.DiskImageUpdater")
-
-    def __init__(self, nodepool, provider, image, snap_image_id,
-                 filename, image_type):
-        super(DiskImageUpdater, self).__init__(nodepool, provider, image,
-                                               snap_image_id)
-        self.filename = filename
-        self.image_type = image_type
-        self.image_name = image.name
-
-    def updateImage(self, session):
-        start_time = time.time()
-        timestamp = int(start_time)
-
-        dummy_image = type('obj', (object,), {'name': self.image_name})
-        image_name = self.provider.template_hostname.format(
-            provider=self.provider, image=dummy_image,
-            timestamp=str(timestamp))
-        self.log.info("Uploading dib image id: %s from %s for %s in %s" %
-                      (self.snap_image.id, self.filename, image_name,
-                       self.provider.name))
-
-        # TODO(mordred) abusing the hostname field
-        self.snap_image.hostname = image_name
-        self.snap_image.version = timestamp
-        session.commit()
-
-        image_id = self.manager.uploadImage(image_name, self.filename,
-                                            self.image_type, 'bare',
-                                            self.image.meta)
-        self.snap_image.external_id = image_id
-        session.commit()
-        self.log.debug("Image id: %s saving image %s" %
-                       (self.snap_image.id, image_id))
-        # It can take a _very_ long time for Rackspace 1.0 to save an image
-        self.manager.waitForImage(image_id, IMAGE_TIMEOUT)
-
-        if statsd:
-            dt = int((time.time() - start_time) * 1000)
-            key = 'nodepool.image_update.%s.%s' % (self.image_name,
-                                                   self.provider.name)
-            statsd.timing(key, dt)
-            statsd.incr(key)
-
-        self.snap_image.state = nodedb.READY
-        session.commit()
-        self.log.info("Image %s in %s is ready" % (self.snap_image.hostname,
-                                                   self.provider.name))
 
 
 class SnapshotImageUpdater(ImageUpdater):
@@ -1140,12 +992,12 @@ class SnapshotImageUpdater(ImageUpdater):
             raise Exception("Image %s for image id: %s status: %s" %
                             (image_id, self.snap_image.id, image['status']))
 
-        if statsd:
+        if self.statsd:
             dt = int((time.time() - start_time) * 1000)
             key = 'nodepool.image_update.%s.%s' % (self.image.name,
                                                    self.provider.name)
-            statsd.timing(key, dt)
-            statsd.incr(key)
+            self.statsd.timing(key, dt)
+            self.statsd.incr(key)
 
         self.snap_image.state = nodedb.READY
         session.commit()
@@ -1229,50 +1081,6 @@ class SnapshotImageUpdater(ImageUpdater):
                      (set_path, env_vars, self.image.setup, server['name']))
 
 
-class ConfigValue(object):
-    pass
-
-
-class Config(ConfigValue):
-    pass
-
-
-class Provider(ConfigValue):
-    pass
-
-
-class ProviderImage(ConfigValue):
-    pass
-
-
-class Target(ConfigValue):
-    pass
-
-
-class Label(ConfigValue):
-    pass
-
-
-class LabelProvider(ConfigValue):
-    pass
-
-
-class Cron(ConfigValue):
-    pass
-
-
-class ZMQPublisher(ConfigValue):
-    pass
-
-
-class GearmanServer(ConfigValue):
-    pass
-
-
-class DiskImage(ConfigValue):
-    pass
-
-
 class NodePool(threading.Thread):
     log = logging.getLogger("nodepool.NodePool")
 
@@ -1287,14 +1095,15 @@ class NodePool(threading.Thread):
         self.zmq_context = None
         self.gearman_client = None
         self.apsched = None
+        self.statsd = stats.get_client()
         self._delete_threads = {}
         self._delete_threads_lock = threading.Lock()
         self._image_delete_threads = {}
         self._image_delete_threads_lock = threading.Lock()
         self._instance_delete_threads = {}
         self._instance_delete_threads_lock = threading.Lock()
-        self._image_builder_queue = Queue.Queue()
-        self._image_builder_thread = None
+        self._image_build_jobs = JobTracker()
+        self._image_upload_jobs = JobTracker()
 
     def stop(self):
         self._stopped = True
@@ -1304,207 +1113,20 @@ class NodePool(threading.Thread):
                 z.listener.join()
         if self.zmq_context:
             self.zmq_context.destroy()
-        if self.apsched:
+        if self.apsched and self.apsched.running:
             self.apsched.shutdown()
 
     def waitForBuiltImages(self):
-        # wait on the queue until everything has been processed
-        self._image_builder_queue.join()
+        self.log.debug("Waiting for images to complete building.")
+        while len(self._image_build_jobs.running_jobs) > 0:
+            time.sleep(.5)
+        self.log.debug("Done waiting for images to complete building.")
 
     def loadConfig(self):
         self.log.debug("Loading configuration")
-        secure = ConfigParser.ConfigParser()
-        secure.readfp(open(self.securefile))
-        config = yaml.load(open(self.configfile))
-        cloud_config = os_client_config.OpenStackConfig()
-
-        newconfig = Config()
-        newconfig.db = None
-        newconfig.dburi = None
-        newconfig.providers = {}
-        newconfig.targets = {}
-        newconfig.labels = {}
-        newconfig.scriptdir = config.get('script-dir')
-        newconfig.elementsdir = config.get('elements-dir')
-        newconfig.imagesdir = config.get('images-dir')
-        newconfig.dburi = secure.get('database', 'dburi')
-        newconfig.provider_managers = {}
-        newconfig.jenkins_managers = {}
-        newconfig.zmq_publishers = {}
-        newconfig.gearman_servers = {}
-        newconfig.diskimages = {}
-        newconfig.crons = {}
-
-        for name, default in [
-            ('image-update', '14 2 * * *'),
-            ('cleanup', '* * * * *'),
-            ('check', '*/15 * * * *'),
-            ]:
-            c = Cron()
-            c.name = name
-            newconfig.crons[c.name] = c
-            c.job = None
-            c.timespec = config.get('cron', {}).get(name, default)
-
-        for addr in config['zmq-publishers']:
-            z = ZMQPublisher()
-            z.name = addr
-            z.listener = None
-            newconfig.zmq_publishers[z.name] = z
-
-        for server in config.get('gearman-servers', []):
-            g = GearmanServer()
-            g.host = server['host']
-            g.port = server.get('port', 4730)
-            g.name = g.host + '_' + str(g.port)
-            newconfig.gearman_servers[g.name] = g
-
-        for provider in config['providers']:
-            p = Provider()
-            p.name = provider['name']
-            newconfig.providers[p.name] = p
-
-            cloud_kwargs = _cloudKwargsFromProvider(provider)
-            p.cloud_config = _get_one_cloud(cloud_config, cloud_kwargs)
-            p.region_name = provider.get('region-name')
-            p.max_servers = provider['max-servers']
-            p.keypair = provider.get('keypair', None)
-            p.pool = provider.get('pool')
-            p.rate = provider.get('rate', 1.0)
-            p.api_timeout = provider.get('api-timeout')
-            p.boot_timeout = provider.get('boot-timeout', 60)
-            p.launch_timeout = provider.get('launch-timeout', 3600)
-            p.use_neutron = bool(provider.get('networks', ()))
-            p.networks = provider.get('networks')
-            p.ipv6_preferred = provider.get('ipv6-preferred')
-            p.azs = provider.get('availability-zones')
-            p.template_hostname = provider.get(
-                'template-hostname',
-                'template-{image.name}-{timestamp}'
-            )
-            p.image_type = provider.get('image-type', 'qcow2')
-            p.images = {}
-            for image in provider['images']:
-                i = ProviderImage()
-                i.name = image['name']
-                p.images[i.name] = i
-                i.base_image = image.get('base-image', None)
-                i.min_ram = image['min-ram']
-                i.name_filter = image.get('name-filter', None)
-                i.setup = image.get('setup', None)
-                i.diskimage = image.get('diskimage', None)
-                i.username = image.get('username', 'jenkins')
-                i.user_home = image.get('user-home', '/home/jenkins')
-                i.private_key = image.get('private-key',
-                                          '/var/lib/jenkins/.ssh/id_rsa')
-                i.config_drive = image.get('config-drive', None)
-
-                # note this does "double-duty" -- for
-                # SnapshotImageUpdater the meta-data dict is passed to
-                # nova when the snapshot image is created.  For
-                # DiskImageUpdater, this dict is expanded and used as
-                # custom properties when the image is uploaded.
-                i.meta = image.get('meta', {})
-                # 5 elements, and no key or value can be > 255 chars
-                # per novaclient.servers.create() rules
-                if i.meta:
-                    if len(i.meta) > 5 or \
-                       any([len(k) > 255 or len(v) > 255
-                            for k, v in i.meta.iteritems()]):
-                        # soft-fail
-                        self.log.error("Invalid metadata for %s; ignored"
-                                       % i.name)
-                        i.meta = {}
-
-        if 'diskimages' in config:
-            for diskimage in config['diskimages']:
-                d = DiskImage()
-                d.name = diskimage['name']
-                newconfig.diskimages[d.name] = d
-                if 'elements' in diskimage:
-                    d.elements = u' '.join(diskimage['elements'])
-                else:
-                    d.elements = ''
-                # must be a string, as it's passed as env-var to
-                # d-i-b, but might be untyped in the yaml and
-                # interpreted as a number (e.g. "21" for fedora)
-                d.release = str(diskimage.get('release', ''))
-                d.env_vars = diskimage.get('env-vars', {})
-                if not isinstance(d.env_vars, dict):
-                    self.log.error("%s: ignoring env-vars; "
-                                   "should be a dict" % d.name)
-                    d.env_vars = {}
-                d.image_types = set()
-            # Do this after providers to build the image-types
-            for provider in newconfig.providers.values():
-                for image in provider.images.values():
-                    if (image.diskimage and
-                        image.diskimage in newconfig.diskimages):
-                        diskimage = newconfig.diskimages[image.diskimage]
-                        diskimage.image_types.add(provider.image_type)
-
-        for label in config['labels']:
-            l = Label()
-            l.name = label['name']
-            newconfig.labels[l.name] = l
-            l.image = label['image']
-            l.min_ready = label.get('min-ready', 2)
-            l.subnodes = label.get('subnodes', 0)
-            l.ready_script = label.get('ready-script')
-            l.providers = {}
-            for provider in label['providers']:
-                p = LabelProvider()
-                p.name = provider['name']
-                l.providers[p.name] = p
-
-        for target in config['targets']:
-            # look at secure file for that section
-            section_name = 'jenkins "%s"' % target['name']
-            t = Target()
-            t.name = target['name']
-            newconfig.targets[t.name] = t
-            t.online = True
-
-            if secure.has_section(section_name):
-                t.jenkins_url = secure.get(section_name, 'url')
-                t.jenkins_user = secure.get(section_name, 'user')
-                t.jenkins_apikey = secure.get(section_name, 'apikey')
-            else:
-                t.jenkins_url = None
-                t.jenkins_user = None
-                t.jenkins_apikey = None
-
-            t.rate = target.get('rate', 1.0)
-            try:
-                t.jenkins_credentials_id = secure.get(
-                    section_name, 'credentials')
-            except:
-                t.jenkins_credentials_id = None
-
-            jenkins = target.get('jenkins')
-            if jenkins:
-                t.jenkins_test_job = jenkins.get('test-job', None)
-            else:
-                t.jenkins_test_job = None
-
-            t.hostname = target.get(
-                'hostname',
-                '{label.name}-{provider.name}-{node_id}'
-            )
-            t.subnode_hostname = target.get(
-                'subnode-hostname',
-                '{label.name}-{provider.name}-{node_id}-{subnode_id}'
-            )
-
-        # A set of image names that are in use by labels, to be
-        # used by the image update methods to determine whether
-        # a given image needs to be updated.
-        newconfig.images_in_use = set()
-        for label in newconfig.labels.values():
-            if label.min_ready >= 0:
-                newconfig.images_in_use.add(label.image)
-
-        return newconfig
+        config = nodepool_config.loadConfig(self.configfile)
+        nodepool_config.loadSecureConfig(config, self.securefile)
+        return config
 
     def reconfigureDatabase(self, config):
         if (not self.config) or config.dburi != self.config.dburi:
@@ -1512,59 +1134,10 @@ class NodePool(threading.Thread):
         else:
             config.db = self.config.db
 
-    def _managersEquiv(self, new_pm, old_pm):
-        # Check if provider details have changed
-        if (new_pm.cloud_config != old_pm.provider.cloud_config or
-            new_pm.max_servers != old_pm.provider.max_servers or
-            new_pm.pool != old_pm.provider.pool or
-            new_pm.image_type != old_pm.provider.image_type or
-            new_pm.rate != old_pm.provider.rate or
-            new_pm.api_timeout != old_pm.provider.api_timeout or
-            new_pm.boot_timeout != old_pm.provider.boot_timeout or
-            new_pm.launch_timeout != old_pm.provider.launch_timeout or
-            new_pm.use_neutron != old_pm.provider.use_neutron or
-            new_pm.networks != old_pm.provider.networks or
-            new_pm.ipv6_preferred != old_pm.provider.ipv6_preferred or
-            new_pm.azs != old_pm.provider.azs):
-            return False
-        new_images = new_pm.images
-        old_images = old_pm.provider.images
-        # Check if new images have been added
-        if set(new_images.keys()) != set(old_images.keys()):
-            return False
-        # check if existing images have been updated
-        for k in new_images:
-            if (new_images[k].base_image != old_images[k].base_image or
-                new_images[k].min_ram != old_images[k].min_ram or
-                new_images[k].name_filter != old_images[k].name_filter or
-                new_images[k].setup != old_images[k].setup or
-                new_images[k].username != old_images[k].username or
-                new_images[k].user_home != old_images[k].user_home or
-                new_images[k].diskimage != old_images[k].diskimage or
-                new_images[k].private_key != old_images[k].private_key or
-                new_images[k].meta != old_images[k].meta or
-                new_images[k].config_drive != old_images[k].config_drive):
-                return False
-        return True
-
     def reconfigureManagers(self, config, check_targets=True):
-        stop_managers = []
-        for p in config.providers.values():
-            oldmanager = None
-            if self.config:
-                oldmanager = self.config.provider_managers.get(p.name)
-            if oldmanager and not self._managersEquiv(p, oldmanager):
-                stop_managers.append(oldmanager)
-                oldmanager = None
-            if oldmanager:
-                config.provider_managers[p.name] = oldmanager
-            else:
-                self.log.debug("Creating new ProviderManager object for %s" %
-                               p.name)
-                config.provider_managers[p.name] = \
-                    provider_manager.ProviderManager(p)
-                config.provider_managers[p.name].start()
+        provider_manager.ProviderManager.reconfigure(self.config, config)
 
+        stop_managers = []
         for t in config.targets.values():
             oldmanager = None
             if self.config:
@@ -1610,27 +1183,25 @@ class NodePool(threading.Thread):
             }
 
         if not self.apsched:
-            self.apsched = apscheduler.scheduler.Scheduler()
+            self.apsched = apscheduler.schedulers.background.BackgroundScheduler()
             self.apsched.start()
 
         for c in config.crons.values():
             if ((not self.config) or
                 c.timespec != self.config.crons[c.name].timespec):
                 if self.config and self.config.crons[c.name].job:
-                    self.apsched.unschedule_job(self.config.crons[c.name].job)
+                    self.config.crons[c.name].job.remove()
                 parts = c.timespec.split()
                 if len(parts) > 5:
                     second = parts[5]
                 else:
                     second = None
                 minute, hour, dom, month, dow = parts[:5]
-                c.job = self.apsched.add_cron_job(
-                    cron_map[c.name],
-                    day=dom,
-                    day_of_week=dow,
-                    hour=hour,
-                    minute=minute,
+                trigger = apscheduler.triggers.cron.CronTrigger(
+                    day=dom, day_of_week=dow, hour=hour, minute=minute,
                     second=second)
+                c.job = self.apsched.add_job(
+                    cron_map[c.name], trigger=trigger)
             else:
                 c.job = self.config.crons[c.name].job
 
@@ -1679,13 +1250,6 @@ class NodePool(threading.Thread):
                 self.log.debug("Adding gearman server %s" % g.name)
                 self.gearman_client.addServer(g.host, g.port)
             self.gearman_client.waitForServer()
-
-    def reconfigureImageBuilder(self):
-        # start disk image builder thread
-        if not self._image_builder_thread:
-            self._image_builder_thread = DiskImageBuilder(self)
-            self._image_builder_thread.daemon = True
-            self._image_builder_thread.start()
 
     def setConfig(self, config):
         self.config = config
@@ -1879,7 +1443,6 @@ class NodePool(threading.Thread):
         self.reconfigureGearmanClient(config)
         self.reconfigureCrons(config)
         self.setConfig(config)
-        self.reconfigureImageBuilder()
 
     def startup(self):
         self.updateConfig()
@@ -1961,25 +1524,7 @@ class NodePool(threading.Thread):
                 # This is either building or in an error state
                 # that will be handled by periodic cleanup
                 return
-            types_found = True
-            diskimage = self.config.diskimages[image.diskimage]
-            for image_type in diskimage.image_types:
-                if (not os.path.exists(
-                        dib_image.filename + '.' + image_type) and
-                    not 'fake-dib-image' in dib_image.filename):
-                    # if image is in ready state, check if image
-                    # file exists in directory, otherwise we need
-                    # to rebuild and delete this buggy image
-                    types_found = False
-                    self.log.warning("Image filename %s does not "
-                                     "exist. Removing image" %
-                                     dib_image.filename)
-                    self.deleteDibImage(dib_image)
-                    break
-            if types_found:
-                # Found a matching image that is READY and has a file
-                found = True
-                break
+            found = True
         if not found:
             # only build the image, we'll recheck again
             self.log.warning("Missing disk image %s" % image.name)
@@ -2091,6 +1636,8 @@ class NodePool(threading.Thread):
         return t
 
     def buildImage(self, image):
+        gearman_job = None
+
         # check if we already have this item in the queue
         with self.getDB().getSession() as session:
             queued_images = session.getBuildingDibImagesByName(image.name)
@@ -2106,44 +1653,117 @@ class NodePool(threading.Thread):
                     filename = os.path.join(self.config.imagesdir,
                                             '%s-%s' %
                                             (image.name, str(timestamp)))
+                    job_uuid = str(uuid4().hex)
 
+                    dib_image = session.createDibImage(image_name=image.name,
+                                                       filename=filename,
+                                                       version=timestamp)
+                    self.log.debug("Created DibImage record %s with state %s",
+                                   dib_image.image_name, dib_image.state)
+
+                    # Submit image-build job
+                    job_data = json.dumps({
+                        'image-id': str(dib_image.id)
+                    })
+                    gearman_job = WatchableJob(
+                        'image-build:%s' % image.name, job_data, job_uuid)
+                    self._image_build_jobs.addJob(gearman_job)
+                    gearman_job.addCompletionHandler(
+                        self.handleImageBuildComplete, image_id=dib_image.id)
+                    gearman_job.addFailureHandler(
+                        self.handleImageBuildFailed, image_id=dib_image.id)
+
+                    self.gearman_client.submitJob(gearman_job)
                     self.log.debug("Queued image building task for %s" %
                                    image.name)
-                    dib_image = session.createDibImage(image_name=image.name,
-                                                       filename=filename)
-
-                    # add this build to queue
-                    self._image_builder_queue.put(dib_image.id)
                 except Exception:
                     self.log.exception(
                         "Could not build image %s", image.name)
 
     def uploadImage(self, session, provider, image_name):
-        provider_entity = self.config.providers[provider]
-        provider_image = provider_entity.images[image_name]
-        images = session.getOrderedReadyDibImages(provider_image.diskimage)
-        if not images:
-            # raise error, no image ready for uploading
-            raise Exception(
-                "No image available for that upload. Please build one first.")
-
         try:
-            filename = images[0].filename
+            provider_entity = self.config.providers[provider]
+            provider_image = provider_entity.images[image_name]
+            images = session.getOrderedReadyDibImages(provider_image.diskimage)
+            image_id = images[0].id
+            timestamp = int(time.time())
+            job_uuid = str(uuid4().hex)
 
-            image_type = provider_entity.image_type
             snap_image = session.createSnapshotImage(
                 provider_name=provider, image_name=provider_image.name)
-            t = DiskImageUpdater(self, provider_entity, provider_image,
-                                 snap_image.id, filename, image_type)
-            t.start()
+            self.log.debug('Created snap_image with job_id %s', job_uuid)
 
-            # Enough time to give them different timestamps (versions)
-            # Just to keep things clearer.
-            time.sleep(2)
-            return t
+            # TODO(mordred) abusing the hostname field
+            snap_image.hostname = image_name
+            snap_image.version = timestamp
+            session.commit()
+
+            # Submit image-upload job
+            gearman_job = WatchableJob(
+                'image-upload:%s' % image_id,
+                json.dumps({
+                    'provider': provider,
+                    'image-name': image_name
+                }),
+                job_uuid)
+            self._image_upload_jobs.addJob(gearman_job)
+            gearman_job.addCompletionHandler(self.handleImageUploadComplete,
+                                             snap_image_id=snap_image.id)
+            self.log.debug('Submitting image-upload job for image id %s',
+                           image_id,)
+            self.gearman_client.submitJob(gearman_job)
+
+            return gearman_job
         except Exception:
             self.log.exception(
                 "Could not upload image %s on %s", image_name, provider)
+
+    def handleImageUploadComplete(self, job, snap_image_id):
+        job_uuid = job.unique
+        job_data = json.loads(job.data[0])
+        external_id = job_data['external-id']
+
+        with self.getDB().getSession() as session:
+            snap_image = session.getSnapshotImage(snap_image_id)
+            if snap_image is None:
+                self.log.error(
+                    'Unable to find matching snap_image for job_id %s',
+                    job_uuid)
+                return
+
+            snap_image.external_id = external_id
+            snap_image.state = nodedb.READY
+            session.commit()
+            self.log.debug('Image %s is ready with external_id %s',
+                           snap_image_id, external_id)
+
+    def handleImageBuildComplete(self, job, image_id):
+        with self.getDB().getSession() as session:
+            dib_image = session.getDibImage(image_id)
+            if dib_image is None:
+                self.log.error(
+                    'Unable to find matching dib_image for image_id %s',
+                    image_id)
+                return
+            dib_image.state = nodedb.READY
+            session.commit()
+            self.log.debug('DIB Image %s (id %d) is ready',
+                           job.name.split(':', 1)[0], image_id)
+
+    def handleImageBuildFailed(self, job, image_id):
+        with self.getDB().getSession() as session:
+            self.log.debug('DIB Image %s (id %d) failed to build. Deleting.',
+                           job.name.split(':', 1)[0], image_id)
+            dib_image = session.getDibImage(image_id)
+            dib_image.delete()
+
+    def handleImageDeleteComplete(self, job, image_id):
+        with self.getDB().getSession() as session:
+            dib_image = session.getDibImage(image_id)
+
+            # Remove image from the nodedb
+            dib_image.state = nodedb.DELETE
+            dib_image.delete()
 
     def launchNode(self, session, provider, label, target):
         try:
@@ -2265,13 +1885,13 @@ class NodePool(threading.Thread):
         node.delete()
         self.log.info("Deleted node id: %s" % node.id)
 
-        if statsd:
+        if self.statsd:
             dt = int((time.time() - node.state_time) * 1000)
             key = 'nodepool.delete.%s.%s.%s' % (image_name,
                                                 node.provider_name,
                                                 node.target_name)
-            statsd.timing(key, dt)
-            statsd.incr(key)
+            self.statsd.timing(key, dt)
+            self.statsd.incr(key)
         self.updateStats(session, node.provider_name)
 
     def deleteImage(self, snap_image_id):
@@ -2327,18 +1947,20 @@ class NodePool(threading.Thread):
         self.log.info("Deleted image id: %s" % snap_image.id)
 
     def deleteDibImage(self, dib_image):
-        image_config = self.config.diskimages.get(dib_image.image_name)
-        if not image_config:
-            # The config was removed deletion will have to be manual
-            return
-        # Delete a dib image and it's associated file
-        for image_type in image_config.image_types:
-            if os.path.exists(dib_image.filename + '.' + image_type):
-                os.remove(dib_image.filename + '.' + image_type)
-
-        dib_image.state = nodedb.DELETE
-        dib_image.delete()
-        self.log.info("Deleted dib image id: %s" % dib_image.id)
+        try:
+            # Submit image-delete job
+            job_uuid = str(uuid4().hex)
+            gearman_job = WatchableJob(
+                'image-delete:%s' % dib_image.id,
+                '', job_uuid
+            )
+            gearman_job.addCompletionHandler(self.handleImageDeleteComplete,
+                                             image_id=dib_image.id)
+            self.gearman_client.submitJob(gearman_job)
+            return gearman_job
+        except Exception:
+            self.log.exception('Could not submit delete job for image id %s',
+                               dib_image.id)
 
     def deleteInstance(self, provider_name, external_id):
         key = (provider_name, external_id)
@@ -2601,7 +2223,7 @@ class NodePool(threading.Thread):
         self.log.debug("Finished periodic check")
 
     def updateStats(self, session, provider_name):
-        if not statsd:
+        if not self.statsd:
             return
         # This may be called outside of the main thread.
 
@@ -2647,16 +2269,16 @@ class NodePool(threading.Thread):
             states[key] += 1
 
         for key, count in states.items():
-            statsd.gauge(key, count)
+            self.statsd.gauge(key, count)
 
         #nodepool.provider.PROVIDER.max_servers
         for provider in self.config.providers.values():
             key = 'nodepool.provider.%s.max_servers' % provider.name
-            statsd.gauge(key, provider.max_servers)
+            self.statsd.gauge(key, provider.max_servers)
 
     def launchStats(self, subkey, dt, image_name,
                     provider_name, target_name, node_az):
-        if not statsd:
+        if not self.statsd:
             return
         #nodepool.launch.provider.PROVIDER.subkey
         #nodepool.launch.image.IMAGE.subkey
@@ -2673,5 +2295,5 @@ class NodePool(threading.Thread):
             keys.append('nodepool.launch.provider.%s.%s.%s' %
                         (provider_name, node_az, subkey))
         for key in keys:
-            statsd.timing(key, dt)
-            statsd.incr(key)
+            self.statsd.timing(key, dt)
+            self.statsd.incr(key)

@@ -30,9 +30,9 @@ import signal
 import traceback
 import threading
 
-# No nodepool imports here because they pull in paramiko which must not be
-# imported until after the daemonization.
-# https://github.com/paramiko/paramiko/issues/59
+import nodepool.builder
+import nodepool.cmd
+import nodepool.nodepool
 
 
 def stack_dump_handler(signum, frame):
@@ -77,9 +77,7 @@ def is_pidfile_stale(pidfile):
     return result
 
 
-class NodePoolDaemon(object):
-    def __init__(self):
-        self.args = None
+class NodePoolDaemon(nodepool.cmd.NodepoolApp):
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser(description='Node pool.')
@@ -96,33 +94,26 @@ class NodePoolDaemon(object):
         parser.add_argument('-p', dest='pidfile',
                             help='path to pid file',
                             default='/var/run/nodepool/nodepool.pid')
+        parser.add_argument('--no-builder', dest='builder',
+                            action='store_false')
         parser.add_argument('--version', dest='version', action='store_true',
                             help='show version')
         self.args = parser.parse_args()
 
-    def setup_logging(self):
-        if self.args.logconfig:
-            fp = os.path.expanduser(self.args.logconfig)
-            if not os.path.exists(fp):
-                raise Exception("Unable to read logging config file at %s" %
-                                fp)
-            logging.config.fileConfig(fp)
-        else:
-            logging.basicConfig(level=logging.DEBUG,
-                                format='%(asctime)s %(levelname)s %(name)s: '
-                                       '%(message)s')
-
     def exit_handler(self, signum, frame):
         self.pool.stop()
+        if self.args.builder:
+            self.builder.stop()
 
     def term_handler(self, signum, frame):
         os._exit(0)
 
     def main(self):
-        import nodepool.nodepool
         self.setup_logging()
         self.pool = nodepool.nodepool.NodePool(self.args.secure,
                                                self.args.config)
+        if self.args.builder:
+            self.builder = nodepool.builder.NodePoolBuilder(self.args.config)
 
         signal.signal(signal.SIGINT, self.exit_handler)
         # For back compatibility:
@@ -132,6 +123,9 @@ class NodePoolDaemon(object):
         signal.signal(signal.SIGTERM, self.term_handler)
 
         self.pool.start()
+        if self.args.builder:
+            nb_thread = threading.Thread(target=self.builder.runForever)
+            nb_thread.start()
 
         while True:
             signal.pause()

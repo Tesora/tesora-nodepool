@@ -197,6 +197,7 @@ class NodePoolCmd(object):
 
     def image_update(self):
         threads = []
+        jobs = []
 
         with self.pool.getDB().getSession() as session:
             self.pool.reconfigureManagers(self.pool.config)
@@ -212,7 +213,7 @@ class NodePoolCmd(object):
                         if image.diskimage not in dib_images_built:
                             self.image_build(image.diskimage)
                             dib_images_built.add(image.diskimage)
-                        threads.append(self.pool.uploadImage(
+                        jobs.append(self.pool.uploadImage(
                             session, provider.name, image.name))
                     elif image:
                         threads.append(self.pool.updateImage(
@@ -225,7 +226,7 @@ class NodePoolCmd(object):
                 image = provider.images.get(self.args.image)
                 if image and image.diskimage:
                     self.image_build(image.diskimage)
-                    threads.append(self.pool.uploadImage(
+                    jobs.append(self.pool.uploadImage(
                         session, provider.name, image.name))
                 elif image:
                     threads.append(self.pool.updateImage(
@@ -235,6 +236,8 @@ class NodePoolCmd(object):
                                     % (self.args.image, self.args.provider))
 
         self._wait_for_threads(threads)
+        for job in jobs:
+            job.waitForCompletion()
 
     def image_build(self, diskimage=None):
         diskimage = diskimage or self.args.image
@@ -243,14 +246,13 @@ class NodePoolCmd(object):
             raise Exception("Trying to build a non disk-image-builder "
                             "image: %s" % diskimage)
 
-        self.pool.reconfigureImageBuilder()
         self.pool.buildImage(self.pool.config.diskimages[diskimage])
         self.pool.waitForBuiltImages()
 
     def image_upload(self):
         self.pool.reconfigureManagers(self.pool.config, False)
 
-        threads = []
+        jobs = []
 
         with self.pool.getDB().getSession() as session:
             if self.args.provider == 'all':
@@ -262,7 +264,7 @@ class NodePoolCmd(object):
                                          "disk-image-builder image: %s",
                                          self.args.image)
                     else:
-                        threads.append(self.pool.uploadImage(
+                        jobs.append(self.pool.uploadImage(
                             session, provider.name, self.args.image))
             else:
                 provider = self.pool.config.providers[self.args.provider]
@@ -270,10 +272,11 @@ class NodePoolCmd(object):
                     raise Exception("Trying to upload a non "
                                     "disk-image-builder image: %s",
                                     self.args.image)
-                threads.append(self.pool.uploadImage(
+                jobs.append(self.pool.uploadImage(
                     session, self.args.provider, self.args.image))
 
-        self._wait_for_threads(threads)
+        for job in jobs:
+            job.waitForCompletion()
 
     def alien_list(self):
         self.pool.reconfigureManagers(self.pool.config, False)
@@ -347,10 +350,12 @@ class NodePoolCmd(object):
                 self.list(node_id=node.id)
 
     def dib_image_delete(self):
+        job = None
         self.pool.reconfigureManagers(self.pool.config, False)
         with self.pool.getDB().getSession() as session:
             dib_image = session.getDibImage(self.args.id)
-            self.pool.deleteDibImage(dib_image)
+            job = self.pool.deleteDibImage(dib_image)
+        job.waitForCompletion()
 
     def image_delete(self):
         self.pool.reconfigureManagers(self.pool.config, False)
@@ -375,6 +380,7 @@ class NodePoolCmd(object):
 
         self.pool = nodepool.NodePool(self.args.secure, self.args.config)
         config = self.pool.loadConfig()
+        self.pool.reconfigureGearmanClient(config)
         self.pool.reconfigureDatabase(config)
         self.pool.setConfig(config)
         self.args.func()
