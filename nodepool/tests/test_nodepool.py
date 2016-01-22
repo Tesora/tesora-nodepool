@@ -14,8 +14,11 @@
 # limitations under the License.
 
 import logging
+import threading
+import time
 
 import fixtures
+import testtools
 
 from nodepool import tests
 from nodepool import nodedb
@@ -49,10 +52,26 @@ class TestNodepool(tests.DBTestCase):
                                      state=nodedb.READY)
             self.assertEqual(len(nodes), 1)
 
+    def test_node_net_name(self):
+        """Test that a node is created with a net name"""
+        configfile = self.setup_config('node_net_name.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        pool.start()
+        self.waitForImage(pool, 'fake-provider', 'fake-image')
+        self.waitForNodes(pool)
+
+        with pool.getDB().getSession() as session:
+            nodes = session.getNodes(provider_name='fake-provider',
+                                     label_name='fake-label',
+                                     target_name='fake-target',
+                                     state=nodedb.READY)
+            self.assertEqual(len(nodes), 1)
+
     def test_dib_node(self):
         """Test that a dib image and node are created"""
         configfile = self.setup_config('node_dib.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
         self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
         self.waitForNodes(pool)
@@ -68,6 +87,7 @@ class TestNodepool(tests.DBTestCase):
         """Test that a dib image and node are created vhd image"""
         configfile = self.setup_config('node_dib_vhd.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
         self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
         self.waitForNodes(pool)
@@ -83,6 +103,7 @@ class TestNodepool(tests.DBTestCase):
         """Test label provided by vhd and qcow2 images builds"""
         configfile = self.setup_config('node_dib_vhd_and_qcow2.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
         self.waitForImage(pool, 'fake-provider1', 'fake-dib-image')
         self.waitForImage(pool, 'fake-provider2', 'fake-dib-image')
@@ -104,6 +125,7 @@ class TestNodepool(tests.DBTestCase):
         """Test that a label with dib and snapshot images build."""
         configfile = self.setup_config('node_dib_and_snap.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
         self.waitForImage(pool, 'fake-provider1', 'fake-dib-image')
         self.waitForImage(pool, 'fake-provider2', 'fake-dib-image')
@@ -125,6 +147,7 @@ class TestNodepool(tests.DBTestCase):
         """Test that snap based nodes build when dib fails."""
         configfile = self.setup_config('node_dib_and_snap_fail.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
         self.addCleanup(pool.stop)
         # fake-provider1 will fail to build fake-dib-image
@@ -149,10 +172,20 @@ class TestNodepool(tests.DBTestCase):
         self.assertEqual(self.subprocesses[0].returncode, 127)
         self.assertEqual(self.subprocesses[-1].returncode, 127)
 
+        with pool.getDB().getSession() as session:
+            while True:
+                dib_images = session.getDibImages()
+                images = filter(lambda x: x.image_name == 'fake-dib-image',
+                                dib_images)
+                if len(images) == 0:
+                    break
+                time.sleep(.2)
+
     def test_dib_upload_fail(self):
         """Test that a dib and snap image upload failure is contained."""
         configfile = self.setup_config('node_dib_and_snap_upload_fail.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
         self.waitForImage(pool, 'fake-provider2', 'fake-dib-image')
         self.waitForNodes(pool)
@@ -170,6 +203,54 @@ class TestNodepool(tests.DBTestCase):
                                      target_name='fake-target',
                                      state=nodedb.READY)
             self.assertEqual(len(nodes), 2)
+
+    def test_dib_snapimage_delete(self):
+        """Test that a dib image (snapshot) can be deleted."""
+        configfile = self.setup_config('node_dib.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
+        pool.start()
+        self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
+        self.waitForNodes(pool)
+        snap_id = None
+
+        with pool.getDB().getSession() as session:
+            snapshot_images = session.getSnapshotImages()
+            self.assertEqual(len(snapshot_images), 1)
+            snap_id = snapshot_images[0].id
+            pool.deleteImage(snap_id)
+
+        self.wait_for_threads()
+
+        with pool.getDB().getSession() as session:
+            while True:
+                snap_image = session.getSnapshotImage(snap_id)
+                if snap_image is None:
+                    break
+                time.sleep(.2)
+
+    def test_dib_image_delete(self):
+        """Test that a dib image (snapshot) can be deleted."""
+        configfile = self.setup_config('node_dib.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
+        pool.start()
+        self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
+        self.waitForNodes(pool)
+        image_id = None
+
+        with pool.getDB().getSession() as session:
+            images = session.getDibImages()
+            self.assertEqual(len(images), 1)
+            image_id = images[0].id
+            pool.deleteDibImage(images[0])
+
+        while True:
+            with pool.getDB().getSession() as session:
+                images = session.getDibImages()
+                if image_id not in [x.id for x in images]:
+                    break
+                time.sleep(.1)
 
     def test_subnodes(self):
         """Test that an image and node are created"""
@@ -403,3 +484,16 @@ class TestNodepool(tests.DBTestCase):
                                      target_name='fake-target',
                                      state=nodedb.READY)
             self.assertEqual(len(nodes), 1)
+
+
+class TestWatchableJob(testtools.TestCase):
+    def test_wait_for_completion(self):
+        wj = nodepool.nodepool.WatchableJob('test', 'test', 'test')
+
+        def call_on_completed():
+            time.sleep(.2)
+            wj.onCompleted()
+
+        t = threading.Thread(target=call_on_completed)
+        t.start()
+        wj.waitForCompletion()
