@@ -1691,7 +1691,9 @@ class NodePool(threading.Thread):
 
             snap_image = session.createSnapshotImage(
                 provider_name=provider, image_name=provider_image.name)
-            self.log.debug('Created snap_image with job_id %s', job_uuid)
+            self.log.debug('Created snapshot image id: %s for upload of '
+                           'DIB image id: %s with job uuid: %s ' %
+                           (snap_image.id, image_id, job_uuid))
 
             # TODO(mordred) abusing the hostname field
             snap_image.hostname = image_name
@@ -1709,8 +1711,8 @@ class NodePool(threading.Thread):
             self._image_upload_jobs.addJob(gearman_job)
             gearman_job.addCompletionHandler(self.handleImageUploadComplete,
                                              snap_image_id=snap_image.id)
-            self.log.debug('Submitting image-upload job for image id %s',
-                           image_id,)
+            self.log.debug('Submitting image-upload job uuid: %s' %
+                           (job_uuid,))
             self.gearman_client.submitJob(gearman_job)
 
             return gearman_job
@@ -1844,7 +1846,7 @@ class NodePool(threading.Thread):
         provider = self.config.providers[node.provider_name]
         target = self.config.targets[node.target_name]
         label = self.config.labels.get(node.label_name, None)
-        if label:
+        if label and label.image in provider.images:
             image_name = provider.images[label.image].name
         else:
             image_name = None
@@ -2194,7 +2196,7 @@ class NodePool(threading.Thread):
             with self.getDB().getSession() as session:
                 self.periodicCheck(session)
         except Exception:
-            self.log.exception("Exception in periodic chack:")
+            self.log.exception("Exception in periodic check:")
 
     def periodicCheck(self, session):
         # This function should be run periodically to make sure we can
