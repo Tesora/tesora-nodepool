@@ -18,8 +18,8 @@ import threading
 import time
 
 import fixtures
-import testtools
 
+from nodepool import jobs
 from nodepool import tests
 from nodepool import nodedb
 import nodepool.fakeprovider
@@ -149,7 +149,6 @@ class TestNodepool(tests.DBTestCase):
         pool = self.useNodepool(configfile, watermark_sleep=1)
         self._useBuilder(configfile)
         pool.start()
-        self.addCleanup(pool.stop)
         # fake-provider1 will fail to build fake-dib-image
         self.waitForImage(pool, 'fake-provider2', 'fake-dib-image')
         self.waitForNodes(pool)
@@ -485,10 +484,87 @@ class TestNodepool(tests.DBTestCase):
                                      state=nodedb.READY)
             self.assertEqual(len(nodes), 1)
 
+    def test_building_image_cleanup_on_start(self):
+        """Test that a building image is deleted on start"""
+        configfile = self.setup_config('node.yaml')
+        pool = nodepool.nodepool.NodePool(self.secure_conf, configfile,
+                                          watermark_sleep=1)
+        try:
+            pool.start()
+            self.waitForImage(pool, 'fake-provider', 'fake-image')
+            self.waitForNodes(pool)
+        finally:
+            # Stop nodepool instance so that it can be restarted.
+            pool.stop()
 
-class TestWatchableJob(testtools.TestCase):
+        with pool.getDB().getSession() as session:
+            images = session.getSnapshotImages()
+            self.assertEqual(len(images), 1)
+            self.assertEqual(images[0].state, nodedb.READY)
+            images[0].state = nodedb.BUILDING
+
+        # Start nodepool instance which should delete our old image.
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        pool.start()
+        # Ensure we have a config loaded for periodic cleanup.
+        while not pool.config:
+            time.sleep(0)
+        # Wait for startup to shift state to a state that periodic cleanup
+        # will act on.
+        while True:
+            with pool.getDB().getSession() as session:
+                if session.getSnapshotImages()[0].state != nodedb.BUILDING:
+                    break
+                print session.getSnapshotImages()[0].state
+                time.sleep(0)
+        # Necessary to force cleanup to happen within the test timeframe
+        pool.periodicCleanup()
+        self.waitForImage(pool, 'fake-provider', 'fake-image')
+        self.waitForNodes(pool)
+
+        with pool.getDB().getSession() as session:
+            images = session.getSnapshotImages()
+            self.assertEqual(len(images), 1)
+            self.assertEqual(images[0].state, nodedb.READY)
+            # should be second image built.
+            self.assertEqual(images[0].id, 2)
+
+    def test_handle_dib_build_gear_disconnect(self):
+        """Ensure a disconnect when waiting for a build is handled properly"""
+        configfile = self.setup_config('node_dib.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        pool.updateConfig()
+        pool.start()
+
+        # wait for the job to be submitted
+        client = tests.GearmanClient()
+        client.addServer('localhost', self.gearman_server.port)
+        client.waitForServer()
+        while client.get_queued_image_jobs() == 0:
+            time.sleep(.2)
+
+        # restart the gearman server to simulate a disconnect
+        self.gearman_server.shutdown()
+        self.useFixture(tests.GearmanServerFixture(self.gearman_server.port))
+
+        # Assert that the dib image is eventually deleted from the database
+        with pool.getDB().getSession() as session:
+            while True:
+                images = session.getDibImages()
+                if len(images) > 0:
+                    time.sleep(.2)
+                    pool.periodicCleanup()
+                else:
+                    break
+
+        self._useBuilder(configfile)
+        self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
+        self.waitForNodes(pool)
+
+
+class TestGearClient(tests.DBTestCase):
     def test_wait_for_completion(self):
-        wj = nodepool.nodepool.WatchableJob('test', 'test', 'test')
+        wj = jobs.WatchableJob('test', 'test', 'test')
 
         def call_on_completed():
             time.sleep(.2)
@@ -497,3 +573,24 @@ class TestWatchableJob(testtools.TestCase):
         t = threading.Thread(target=call_on_completed)
         t.start()
         wj.waitForCompletion()
+
+    def test_handle_disconnect(self):
+        class MyJob(jobs.WatchableJob):
+            def __init__(self, *args, **kwargs):
+                super(MyJob, self).__init__(*args, **kwargs)
+                self.disconnect_called = False
+
+            def onDisconnect(self):
+                super(MyJob, self).onDisconnect()
+                self.disconnect_called = True
+
+        client = nodepool.nodepool.GearmanClient()
+        client.addServer('localhost', self.gearman_server.port)
+        client.waitForServer()
+
+        job = MyJob('test-job', '', '')
+        client.submitJob(job)
+
+        self.gearman_server.shutdown()
+        job.waitForCompletion()
+        self.assertEqual(job.disconnect_called, True)
