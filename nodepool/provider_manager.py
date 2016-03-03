@@ -483,6 +483,12 @@ class ProviderManager(TaskManager):
                         provider=self.provider.name,
                         id=resource_id,
                         status=status))
+                if status == 'ERROR' and 'fault' in resource:
+                    self.log.debug(
+                        'ERROR in {provider} on {id}: {resason}'.format(
+                            provider=self.provider.name,
+                            id=resource_id,
+                            resason=resource['fault']['message']))
             last_status = status
             if status in ['ACTIVE', 'ERROR']:
                 return resource
@@ -632,7 +638,15 @@ class ProviderManager(TaskManager):
         # This will either get the server or raise an exception
         server = self.getServerFromList(server_id)
 
-        if self.hasExtension('os-floating-ips'):
+        has_floating_ip = False
+        for (name, network) in server['addresses'].iteritems():
+            for interface_spec in network:
+                if interface_spec['version'] != 4:
+                    continue
+                if ('OS-EXT-IPS:type' in interface_spec
+                        and interface_spec['OS-EXT-IPS:type'] == 'floating'):
+                    has_floating_ip = True
+        if has_floating_ip:
             for ip in self.listFloatingIPs():
                 if ip['instance_id'] == server_id:
                     self.log.debug('Deleting floating ip for server %s' %
