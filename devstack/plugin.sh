@@ -97,7 +97,7 @@ function nodepool_write_config {
 keys=simple
 
 [loggers]
-keys=root,nodepool
+keys=root,nodepool,shade
 
 [handlers]
 keys=console
@@ -110,6 +110,12 @@ handlers=console
 level=DEBUG
 handlers=console
 qualname=nodepool
+propagate=0
+
+[logger_shade]
+level=DEBUG
+handlers=console
+qualname=shade
 propagate=0
 
 [handler_console]
@@ -225,6 +231,15 @@ diskimages:
 EOF
 
     sudo mv /tmp/nodepool.yaml $NODEPOOL_CONFIG
+    cp /etc/openstack/clouds.yaml /tmp
+    cat >>/tmp/clouds.yaml <<EOF
+cache:
+  expiration:
+    server: 5
+    port: 5
+EOF
+    sudo mv /tmp/clouds.yaml /etc/openstack/clouds.yaml
+    mkdir -p $HOME/.cache/openstack/
 }
 
 # Initialize database
