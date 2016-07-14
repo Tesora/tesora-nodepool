@@ -38,10 +38,6 @@ IMAGE_TIMEOUT = 6 * HOURS    # How long to wait for an image save
 # so just hardcode it for all qcow2 building
 DEFAULT_QEMU_IMAGE_COMPAT_OPTIONS = "--qemu-img-options 'compat=0.10'"
 
-# TODO: make this configurable
-BUILD_WORKERS = 1
-UPLOAD_WORKERS = 4
-
 
 class DibImageFile(object):
     def __init__(self, image_id, extension=None):
@@ -84,12 +80,7 @@ class BaseWorker(gear.Worker):
 
     def __init__(self, *args, **kw):
         self.builder = kw.pop('builder')
-        self.running = True
         super(BaseWorker, self).__init__(*args, **kw)
-
-    def stop(self):
-        self.running = False
-        self.stopWaitingForJobs()
 
     def run(self):
         while self.running:
@@ -173,12 +164,14 @@ class UploadWorker(BaseWorker):
 class NodePoolBuilder(object):
     log = logging.getLogger("nodepool.builder")
 
-    def __init__(self, config_path):
+    def __init__(self, config_path, build_workers=1, upload_workers=4):
         self._config_path = config_path
         self._running = False
         self._built_image_ids = set()
         self._start_lock = threading.Lock()
         self._config = None
+        self._build_workers = build_workers
+        self._upload_workers = upload_workers
         self.statsd = stats.get_client()
 
     @property
@@ -195,13 +188,13 @@ class NodePoolBuilder(object):
 
             self.build_workers = []
             self.upload_workers = []
-            for i in range(BUILD_WORKERS):
+            for i in range(self._build_workers):
                 w = BuildWorker('Nodepool Builder Build Worker %s' % (i+1,),
                                 builder=self)
                 self._initializeGearmanWorker(w,
                     self._config.gearman_servers.values())
                 self.build_workers.append(w)
-            for i in range(UPLOAD_WORKERS):
+            for i in range(self._upload_workers):
                 w = UploadWorker('Nodepool Builder Upload Worker %s' % (i+1,),
                                  builder=self)
                 self._initializeGearmanWorker(w,
@@ -229,18 +222,10 @@ class NodePoolBuilder(object):
 
     def stop(self):
         with self._start_lock:
-            self.log.debug('Stopping')
+            self.log.debug('Stopping.')
             if not self._running:
-                self.log.warning("Stop called when we are already stopped.")
+                self.log.warning("Stop called when already stopped")
                 return
-
-
-            for worker in self.build_workers + self.upload_workers:
-                worker.stop()
-
-            # Wait for the builder to complete any currently running jobs
-            while self._running:
-                time.sleep(1)
 
             for worker in self.build_workers + self.upload_workers:
                 try:
@@ -249,9 +234,18 @@ class NodePoolBuilder(object):
                     if e.errno == errno.EBADF:
                         # The connection has been lost already
                         self.log.debug("Gearman connection lost when "
-                                       "attempting to shutdown. Ignoring.")
+                                       "attempting to shutdown; ignoring")
                     else:
                         raise
+
+            self.log.debug('Waiting for jobs to complete')
+            # Wait for the builder to complete any currently running jobs
+            while self._running:
+                time.sleep(1)
+
+            self.log.debug('Stopping providers')
+            provider_manager.ProviderManager.stopProviders(self._config)
+            self.log.debug('Finished stopping')
 
     def load_config(self, config_path):
         config = nodepool_config.loadConfig(config_path)

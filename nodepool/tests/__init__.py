@@ -29,6 +29,7 @@ import time
 
 import fixtures
 import gear
+import kazoo.client
 import testresources
 import testtools
 
@@ -107,6 +108,120 @@ class GearmanServerFixture(fixtures.Fixture):
                 pass
             else:
                 raise
+
+
+class ZookeeperServerFixture(fixtures.Fixture):
+    def __init__(self, port=0):
+        self._port = port
+
+    def setUp(self):
+        super(ZookeeperServerFixture, self).setUp()
+
+        if 'NODEPOOL_ZK_HOST' in os.environ:
+           if ':' in os.environ['NODEPOOL_ZK_HOST']:
+               host, port = os.environ['NODEPOOL_ZK_HOST'].split(':')
+           else:
+               host = os.environ['NODEPOOL_ZK_HOST']
+               port = None
+
+           self.zookeeper_host = host
+
+           if not port:
+               self.zookeeper_port = 2181
+           else:
+               self.zookeeper_port = int(port)
+
+           return
+
+        self.zookeeper_host = '127.0.0.1'
+
+        # Get the local port range, we're going to pick one at a time
+        # at random to try.
+        with open('/proc/sys/net/ipv4/ip_local_port_range') as f:
+            line = f.readline()
+            begin, end = map(int, line.split())
+
+        zookeeper_fixtures = os.path.join(os.path.dirname(__file__),
+                                          'fixtures', 'zookeeper')
+
+        # Make a tmpdir to hold the config file, zookeeper data dir,
+        # and log file.
+        tmp_root = self.useFixture(fixtures.TempDir()).path
+        with open(os.path.join(zookeeper_fixtures, 'log4j.properties')) as i:
+            with open(os.path.join(tmp_root, 'log4j.properties'), 'w') as o:
+                o.write(i.read())
+
+        config_path = os.path.join(tmp_root, 'zoo.cfg')
+        log_path = os.path.join(tmp_root, 'zookeeper.log')
+
+        classpath = [
+            tmp_root,
+            '/usr/share/java/jline.jar',
+            '/usr/share/java/log4j-1.2.jar',
+            '/usr/share/java/xercesImpl.jar',
+            '/usr/share/java/xmlParserAPIs.jar',
+            '/usr/share/java/netty.jar',
+            '/usr/share/java/slf4j-api.jar',
+            '/usr/share/java/slf4j-log4j12.jar',
+            '/usr/share/java/zookeeper.jar',
+        ]
+        classpath = ':'.join(classpath)
+
+        args = ['/usr/bin/java', '-cp', classpath,
+                '-Dzookeeper.log.dir=%s' % (tmp_root,),
+                '-Dzookeeper.root.logger=INFO,ROLLINGFILE',
+                'org.apache.zookeeper.server.quorum.QuorumPeerMain',
+                config_path]
+
+        found_port = False
+
+        # Try a random port in the local port range one at a time
+        # until we find one that's available.
+        while not found_port:
+            port = random.randrange(begin, end)
+
+            # Write a config file with this port.
+            with open(os.path.join(zookeeper_fixtures, 'zoo.cfg')) as i:
+                with open(config_path, 'w') as o:
+                    o.write(i.read().format(datadir=os.path.join(tmp_root, 'data'),
+                                            port=port))
+
+            # Run zookeeper.
+            p = subprocess.Popen(args)
+
+            # Wait up to 30 seconds to figure out if it has started.
+            for x in range(30):
+                r = self._checkZKLog(log_path)
+                if r is True:
+                    found_port = True
+                    break
+                elif r is False:
+                    break
+                time.sleep(1)
+
+            if not found_port:
+                p.kill()
+                p.wait()
+
+        if found_port:
+            self.zookeeper_port = port
+            self.zookeeper_process = p
+            self.addCleanup(self.shutdownZookeeper)
+
+    def _checkZKLog(self, path):
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            for line in f:
+                if 'Snapshotting:' in line:
+                    return True
+                if 'Address already in use' in line:
+                    return False
+        return None
+
+    def shutdownZookeeper(self):
+        self.zookeeper_process.kill()
+        self.zookeeper_process.wait()
 
 
 class GearmanClient(gear.Client):
@@ -397,3 +512,45 @@ class DBTestCase(BaseTestCase):
 class IntegrationTestCase(DBTestCase):
     def setUpFakes(self):
         pass
+
+
+class ZKTestCase(BaseTestCase):
+    def setUp(self):
+        super(ZKTestCase, self).setUp()
+        f = ZookeeperServerFixture()
+        self.useFixture(f)
+        self.zookeeper_host = f.zookeeper_host
+        self.zookeeper_port = f.zookeeper_port
+        self.chroot_path = "/nodepool_test/%s" % self.getUniqueInteger()
+
+        # Ensure the chroot path exists and clean up an pre-existing znodes
+        _tmp_client = kazoo.client.KazooClient(
+            hosts='%s:%s' % (self.zookeeper_host, self.zookeeper_port))
+        _tmp_client.start()
+
+        if _tmp_client.exists(self.chroot_path):
+            _tmp_client.delete(self.chroot_path, recursive=True)
+
+        _tmp_client.ensure_path(self.chroot_path)
+        _tmp_client.stop()
+
+        # Create a chroot'ed client
+        self.zkclient = kazoo.client.KazooClient(
+            hosts='%s:%s%s' % (self.zookeeper_host,
+                               self.zookeeper_port,
+                               self.chroot_path)
+        )
+        self.zkclient.start()
+
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        '''Stop the client and remove the chroot path.'''
+        self.zkclient.stop()
+
+        # Need a non-chroot'ed client to remove the chroot path
+        _tmp_client = kazoo.client.KazooClient(
+            hosts='%s:%s' % (self.zookeeper_host, self.zookeeper_port))
+        _tmp_client.start()
+        _tmp_client.delete(self.chroot_path, recursive=True)
+        _tmp_client.stop()

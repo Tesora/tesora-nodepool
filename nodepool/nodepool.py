@@ -107,6 +107,24 @@ class NodeCompleteThread(threading.Thread):
                           node.id)
             return
 
+        nodepool_job = session.getJobByName(self.jobname)
+        if (nodepool_job and nodepool_job.hold_on_failure and
+            self.result != 'SUCCESS'):
+            held_nodes = session.getNodes(state=nodedb.HOLD)
+            held_nodes = [n for n in held_nodes if self.jobname in n.comment]
+            if len(held_nodes) >= nodepool_job.hold_on_failure:
+                self.log.info("Node id: %s has failed %s but %s nodes "
+                              "are already held for that job" % (
+                                  node.id, self.jobname, len(held_nodes)))
+            else:
+                node.state = nodedb.HOLD
+                node.comment = "Automatically held after failing %s" % (
+                    self.jobname,)
+                self.log.info("Node id: %s failed %s, automatically holding" % (
+                    node.id, self.jobname))
+                self.nodepool.updateStats(session, node.provider_name)
+                return
+
         target = self.nodepool.config.targets[node.target_name]
         if self.jobname == target.jenkins_test_job:
             self.log.debug("Test job for node id: %s complete, result: %s" %
@@ -248,11 +266,39 @@ class GearmanClient(gear.Client):
         super(GearmanClient, self).__init__(client_id='nodepool')
         self.__log = logging.getLogger("nodepool.GearmanClient")
 
-    def getNeededWorkers(self):
+    def getNeededWorkers(self, session):
         needed_workers = {}
-        job_worker_map = {}
-        unspecified_jobs = {}
+        function_worker_map = {}
         for connection in self.active_connections:
+            try:
+                req = gear.WorkersAdminRequest()
+                connection.sendAdminRequest(req, timeout=300)
+            except Exception:
+                self.__log.exception("Exception while listing workers")
+                self._lostConnection(connection)
+                continue
+            # Populate function_worker_map here
+            for line in req.response.split('\n'):
+                parts = [x.strip() for x in line.split(':', 1)]
+                # parts[0] - Connection details
+                # parts[1] - Functions that remote connection can execute
+                if len(parts) < 2 or not parts[0] or parts[0] == '.':
+                    # Skip if end of response or if no functions list.
+                    continue
+                (conn_fd, remote_ip, nodename) = parts[0].split(None, 2)
+                # Not every worker reg has build: functions so filter
+                # and only handle those entries.
+                functions = [x[len('build:'):]
+                             for x in parts[1].split()
+                             if x.startswith('build:')]
+                if functions:
+                    node = session.getNodeByNodename(nodename)
+                    if node:
+                        worker = node.label_name
+                        for function in functions:
+                            workers = function_worker_map.setdefault(function,
+                                                                     set())
+                            workers.add(worker)
             try:
                 req = gear.StatusAdminRequest()
                 connection.sendAdminRequest(req, timeout=300)
@@ -288,29 +334,18 @@ class GearmanClient(gear.Client):
                 if queued > 0:
                     self.__log.debug("Function: %s queued: %s" % (function,
                                                                   queued))
-                if ':' in function:
-                    fparts = function.split(':')
-                    # fparts[0] - function name
-                    # fparts[1] - target node [type]
-                    job = fparts[-2]
-                    worker = fparts[-1]
-                    workers = job_worker_map.get(job, [])
-                    workers.append(worker)
-                    job_worker_map[job] = workers
-                    if queued > 0:
-                        needed_workers[worker] = (
-                            needed_workers.get(worker, 0) + queued)
-                elif queued > 0:
-                    job = function
-                    unspecified_jobs[job] = (unspecified_jobs.get(job, 0) +
-                                             queued)
-        for job, queued in unspecified_jobs.items():
-            workers = job_worker_map.get(job)
-            if not workers:
-                continue
-            worker = workers[0]
-            needed_workers[worker] = (needed_workers.get(worker, 0) +
-                                      queued)
+                workers = function_worker_map.get(function)
+                # We assume worker was populated by function_worker_map
+                # fillout above in the workers status parsing.
+                if not workers:
+                    continue
+                # Get worker for use in populating needed_workers.
+                # Set pop removes entries so we add it back in after popping.
+                worker = workers.pop()
+                workers.add(worker)
+                if queued > 0:
+                    needed_workers[worker] = (
+                        needed_workers.get(worker, 0) + queued)
         return needed_workers
 
     def handleWorkComplete(self, packet):
@@ -434,10 +469,12 @@ class NodeLauncher(threading.Thread):
                     statsd_key = 'error.unknown'
 
             try:
+
                 self.nodepool.launchStats(statsd_key, dt, self.image.name,
                                           self.provider.name,
                                           self.target.name,
-                                          self.node.az)
+                                          self.node.az,
+                                          self.node.manager_name)
             except Exception:
                 self.log.exception("Exception reporting launch stats:")
 
@@ -562,6 +599,10 @@ class NodeLauncher(threading.Thread):
             self.createJenkinsNode()
             self.log.info("Node id: %s added to jenkins" % self.node.id)
 
+        if self.target.assign_via_gearman:
+            self.log.info("Node id: %s assigning via gearman" % self.node.id)
+            self.assignViaGearman()
+
         return dt
 
     def createJenkinsNode(self):
@@ -585,6 +626,24 @@ class NodeLauncher(threading.Thread):
         if self.target.jenkins_test_job:
             params = dict(NODE=self.node.nodename)
             jenkins.startBuild(self.target.jenkins_test_job, params)
+
+    def assignViaGearman(self):
+        args = dict(name=self.node.nodename,
+                    host=self.node.ip,
+                    description='Dynamic single use %s node' % self.label.name,
+                    labels=self.label.name,
+                    root=self.image.user_home)
+        job = jobs.NodeAssignmentJob(self.node.id, self.node.target_name,
+                                     args, self.nodepool)
+        self.nodepool.gearman_client.submitJob(job, timeout=300)
+        job.waitForCompletion()
+        self.log.info("Node id: %s received %s from assignment" % (
+            self.node.id, job.data))
+        if job.failure:
+            raise Exception("Node id: %s received job failure on assignment" %
+                            self.node.id)
+        data = json.loads(job.data[-1])
+        self.node.manager_name = data['manager']
 
     def writeNodepoolInfo(self, nodelist):
         key = paramiko.RSAKey.generate(2048)
@@ -677,7 +736,8 @@ class SubNodeLauncher(threading.Thread):
     log = logging.getLogger("nodepool.SubNodeLauncher")
 
     def __init__(self, nodepool, provider, label, subnode_id,
-                 node_id, node_target_name, timeout, launch_timeout, node_az):
+                 node_id, node_target_name, timeout, launch_timeout, node_az,
+                 manager_name):
         threading.Thread.__init__(self, name='SubNodeLauncher for %s'
                                   % subnode_id)
         self.provider = provider
@@ -690,6 +750,7 @@ class SubNodeLauncher(threading.Thread):
         self.nodepool = nodepool
         self.launch_timeout = launch_timeout
         self.node_az = node_az
+        self.manager_name = manager_name
 
     def run(self):
         try:
@@ -731,7 +792,8 @@ class SubNodeLauncher(threading.Thread):
                 self.nodepool.launchStats(statsd_key, dt, self.image.name,
                                           self.provider.name,
                                           self.node_target_name,
-                                          self.node_az)
+                                          self.node_az,
+                                          self.manager_name)
             except Exception:
                 self.log.exception("Exception reporting launch stats:")
 
@@ -1103,17 +1165,25 @@ class NodePool(threading.Thread):
         self._instance_delete_threads = {}
         self._instance_delete_threads_lock = threading.Lock()
         self._image_build_jobs = JobTracker()
+        self._wake_condition = threading.Condition()
 
     def stop(self):
         self._stopped = True
+        self._wake_condition.acquire()
+        self._wake_condition.notify()
+        self._wake_condition.release()
         if self.config:
             for z in self.config.zmq_publishers.values():
                 z.listener.stop()
                 z.listener.join()
+            provider_manager.ProviderManager.stopProviders(self.config)
         if self.zmq_context:
             self.zmq_context.destroy()
         if self.apsched and self.apsched.running:
             self.apsched.shutdown()
+        if self.gearman_client:
+            self.gearman_client.shutdown()
+        self.log.debug("finished stopping")
 
     def waitForBuiltImages(self):
         self.log.debug("Waiting for images to complete building.")
@@ -1270,7 +1340,7 @@ class NodePool(threading.Thread):
         self.log.debug("Beginning node launch calculation")
         # Get the current demand for nodes.
         if self.gearman_client:
-            label_demand = self.gearman_client.getNeededWorkers()
+            label_demand = self.gearman_client.getNeededWorkers(session)
         else:
             label_demand = {}
 
@@ -1478,7 +1548,9 @@ class NodePool(threading.Thread):
                     self._run(session, allocation_history)
             except Exception:
                 self.log.exception("Exception in main loop:")
-            time.sleep(self.watermark_sleep)
+            self._wake_condition.acquire()
+            self._wake_condition.wait(self.watermark_sleep)
+            self._wake_condition.release()
 
     def _run(self, session, allocation_history):
         self.checkForMissingImages(session)
@@ -1754,7 +1826,7 @@ class NodePool(threading.Thread):
         subnode = session.createSubNode(node)
         t = SubNodeLauncher(self, provider, label, subnode.id,
                             node.id, node.target_name, timeout, launch_timeout,
-                            node_az=node.az)
+                            node_az=node.az, manager_name=node.manager_name)
         t.start()
 
     def deleteSubNode(self, subnode, manager):
@@ -1785,6 +1857,13 @@ class NodePool(threading.Thread):
         finally:
             self._delete_threads_lock.release()
 
+    def revokeAssignedNode(self, node):
+        args = dict(name=node.nodename)
+        job = jobs.NodeRevokeJob(node.id, node.manager_name,
+                                 args, self)
+        self.gearman_client.submitJob(job, timeout=300)
+        # Do not wait for completion in case the manager is offline
+
     def _deleteNode(self, session, node):
         self.log.debug("Deleting node id: %s which has been in %s "
                        "state for %s hours" %
@@ -1810,6 +1889,13 @@ class NodePool(threading.Thread):
             if jenkins.nodeExists(jenkins_name):
                 jenkins.deleteNode(jenkins_name)
             self.log.info("Deleted jenkins node id: %s" % node.id)
+
+        if node.manager_name is not None:
+            try:
+                self.revokeAssignedNode(node)
+            except Exception:
+                self.log.exception("Exception revoking node id: %s" %
+                                   node.id)
 
         for subnode in node.subnodes:
             if subnode.external_id:
@@ -2054,6 +2140,8 @@ class NodePool(threading.Thread):
                                              server['name'], server['id'],
                                              provider.name))
                         continue
+            if provider.clean_floating_ips:
+                manager.cleanupLeakedFloaters()
 
     def cleanupOneNode(self, session, node):
         now = time.time()
@@ -2207,6 +2295,8 @@ class NodePool(threading.Thread):
                     provider.name, state)
                 states[key] = 0
 
+        managers = set()
+
         for node in session.getNodes():
             if node.state not in nodedb.STATE_NAMES:
                 continue
@@ -2214,8 +2304,18 @@ class NodePool(threading.Thread):
             key = 'nodepool.nodes.%s' % state
             states[key] += 1
 
-            key = 'nodepool.target.%s.nodes.%s' % (
-                node.target_name, state)
+            # NOTE(pabelanger): Check if we assign nodes via Gearman if so, use
+            # the manager name.
+            #nodepool.manager.MANAGER.nodes.STATE
+            if node.manager_name:
+                key = 'nodepool.manager.%s.nodes.%s' % (
+                    node.manager_name, state)
+                if key not in states:
+                    states[key] = 0
+                managers.add(node.manager_name)
+            else:
+                key = 'nodepool.target.%s.nodes.%s' % (
+                    node.target_name, state)
             states[key] += 1
 
             key = 'nodepool.label.%s.nodes.%s' % (
@@ -2226,6 +2326,16 @@ class NodePool(threading.Thread):
                 node.provider_name, state)
             states[key] += 1
 
+        # NOTE(pabelanger): Initialize other state values to zero if missed
+        # above.
+        #nodepool.manager.MANAGER.nodes.STATE
+        for state in nodedb.STATE_NAMES.values():
+            for manager_name in managers:
+                key = 'nodepool.manager.%s.nodes.%s' % (
+                    manager_name, state)
+                if key not in states:
+                    states[key] = 0
+
         for key, count in states.items():
             self.statsd.gauge(key, count)
 
@@ -2235,23 +2345,33 @@ class NodePool(threading.Thread):
             self.statsd.gauge(key, provider.max_servers)
 
     def launchStats(self, subkey, dt, image_name,
-                    provider_name, target_name, node_az):
+                    provider_name, target_name, node_az, manager_name):
         if not self.statsd:
             return
         #nodepool.launch.provider.PROVIDER.subkey
         #nodepool.launch.image.IMAGE.subkey
-        #nodepool.launch.target.TARGET.subkey
         #nodepool.launch.subkey
         keys = [
             'nodepool.launch.provider.%s.%s' % (provider_name, subkey),
             'nodepool.launch.image.%s.%s' % (image_name, subkey),
-            'nodepool.launch.target.%s.%s' % (target_name, subkey),
             'nodepool.launch.%s' % (subkey,),
             ]
         if node_az:
             #nodepool.launch.provider.PROVIDER.AZ.subkey
             keys.append('nodepool.launch.provider.%s.%s.%s' %
                         (provider_name, node_az, subkey))
+
+        if manager_name:
+            # NOTE(pabelanger): Check if we assign nodes via Gearman if so, use
+            # the manager name.
+            #nodepool.launch.manager.MANAGER.subkey
+            keys.append('nodepool.launch.manager.%s.%s' %
+                        (manager_name, subkey))
+        else:
+            #nodepool.launch.target.TARGET.subkey
+            keys.append('nodepool.launch.target.%s.%s' %
+                        (target_name, subkey))
+
         for key in keys:
             self.statsd.timing(key, dt)
             self.statsd.incr(key)

@@ -45,7 +45,7 @@ class TestNodepoolCMD(tests.DBTestCase):
         self.assert_listed(configfile, ['image-list'], 7, status, image_cnt)
 
     def assert_nodes_listed(self, configfile, node_cnt, status="ready"):
-        self.assert_listed(configfile, ['list'], 9, status, node_cnt)
+        self.assert_listed(configfile, ['list'], 10, status, node_cnt)
 
     def test_snapshot_image_update(self):
         configfile = self.setup_config("node.yaml")
@@ -233,7 +233,7 @@ class TestNodepoolCMD(tests.DBTestCase):
         self.assert_listed(configfile, ['list'], 0, 1, 1)
         self.assert_nodes_listed(configfile, 1, 'ready')
         # Delete node 1
-        self.assert_listed(configfile, ['delete', '1'], 9, 'delete', 1)
+        self.assert_listed(configfile, ['delete', '1'], 10, 'delete', 1)
 
     def test_delete_now(self):
         configfile = self.setup_config('node.yaml')
@@ -257,3 +257,20 @@ class TestNodepoolCMD(tests.DBTestCase):
         self.patch_argv("-c", configfile, "image-build", "fake-dib-diskimage")
         nodepoolcmd.main()
         self.assert_listed(configfile, ['dib-image-list'], 4, 'ready', 1)
+
+    def test_job_create(self):
+        configfile = self.setup_config('node.yaml')
+        self.patch_argv("-c", configfile, "job-create", "fake-job",
+                        "--hold-on-failure", "1")
+        nodepoolcmd.main()
+        self.assert_listed(configfile, ['job-list'], 2, 1, 1)
+
+    def test_job_delete(self):
+        configfile = self.setup_config('node.yaml')
+        self.patch_argv("-c", configfile, "job-create", "fake-job",
+                        "--hold-on-failure", "1")
+        nodepoolcmd.main()
+        self.assert_listed(configfile, ['job-list'], 2, 1, 1)
+        self.patch_argv("-c", configfile, "job-delete", "1")
+        nodepoolcmd.main()
+        self.assert_listed(configfile, ['job-list'], 0, 1, 0)
