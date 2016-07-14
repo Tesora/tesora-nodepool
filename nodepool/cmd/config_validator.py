@@ -76,7 +76,8 @@ class ConfigValidator:
             'launch-timeout': int,
             'rate': float,
             'images': [images],
-            'template-hostname': str
+            'template-hostname': str,
+            'clean-floating-ips': bool,
         }
 
         labels = {
@@ -94,6 +95,7 @@ class ConfigValidator:
             'name': str,
             'hostname': str,
             'subnode-hostname': str,
+            'assign-via-gearman': bool,
             'jenkins': {
                 'url': str,
                 'user': str,

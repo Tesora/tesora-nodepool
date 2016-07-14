@@ -87,6 +87,7 @@ node_table = Table(
     Column('provider_name', String(255), index=True, nullable=False),
     Column('label_name', String(255), index=True, nullable=False),
     Column('target_name', String(255), index=True, nullable=False),
+    Column('manager_name', String(255)),
     # Machine name
     Column('hostname', String(255), index=True),
     # Eg, jenkins node name
@@ -103,6 +104,8 @@ node_table = Table(
     Column('state', Integer),
     # Time of last state change
     Column('state_time', Integer),
+    # Comment about the state of the node - used to annotate held nodes
+    Column('comment', String(255)),
     mysql_engine='InnoDB',
     )
 subnode_table = Table(
@@ -121,6 +124,15 @@ subnode_table = Table(
     Column('state', Integer),
     # Time of last state change
     Column('state_time', Integer),
+    mysql_engine='InnoDB',
+    )
+job_table = Table(
+    'job', metadata,
+    Column('id', Integer, primary_key=True),
+    # The name of the job
+    Column('name', String(255), index=True),
+    # Automatically hold up to this number of nodes that fail this job
+    Column('hold_on_failure', Integer),
     mysql_engine='InnoDB',
     )
 
@@ -183,16 +195,18 @@ class SnapshotImage(object):
 class Node(object):
     def __init__(self, provider_name, label_name, target_name, az,
                  hostname=None, external_id=None, ip=None, ip_private=None,
-                 state=BUILDING):
+                 manager_name=None, state=BUILDING, comment=None):
         self.provider_name = provider_name
         self.label_name = label_name
         self.target_name = target_name
+        self.manager_name = manager_name
         self.external_id = external_id
         self.az = az
         self.ip = ip
         self.ip_private = ip_private
         self.hostname = hostname
         self.state = state
+        self.comment = comment
 
     def delete(self):
         session = Session.object_session(self)
@@ -242,6 +256,20 @@ class SubNode(object):
         session = Session.object_session(self)
         if session:
             session.commit()
+
+
+class Job(object):
+    def __init__(self, name=None, hold_on_failure=0):
+        self.name = name
+        self.hold_on_failure = hold_on_failure
+
+    def delete(self):
+        session = Session.object_session(self)
+        session.delete(self)
+        session.commit()
+
+
+mapper(Job, job_table)
 
 
 mapper(SubNode, subnode_table,
@@ -455,3 +483,24 @@ class NodeDatabaseSession(object):
         if not nodes:
             return None
         return nodes[0]
+
+    def getJob(self, id):
+        jobs = self.session().query(Job).filter_by(id=id).all()
+        if not jobs:
+            return None
+        return jobs[0]
+
+    def getJobByName(self, name):
+        jobs = self.session().query(Job).filter_by(name=name).all()
+        if not jobs:
+            return None
+        return jobs[0]
+
+    def getJobs(self):
+        return self.session().query(Job).all()
+
+    def createJob(self, *args, **kwargs):
+        new = Job(*args, **kwargs)
+        self.session().add(new)
+        self.commit()
+        return new

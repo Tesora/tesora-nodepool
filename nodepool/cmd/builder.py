@@ -16,6 +16,7 @@ import argparse
 import extras
 import signal
 import sys
+import threading
 
 import daemon
 
@@ -31,6 +32,7 @@ class NodePoolBuilder(nodepool.cmd.NodepoolApp):
 
     def sigint_handler(self, signal, frame):
         self.nb.stop()
+        sys.exit(0)
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser(description='NodePool Image Builder.')
@@ -45,15 +47,27 @@ class NodePoolBuilder(nodepool.cmd.NodepoolApp):
                                     'nodepool-builder.pid')
         parser.add_argument('-d', dest='nodaemon', action='store_true',
                             help='do not run as a daemon')
+        parser.add_argument('--build-workers', dest='build_workers',
+                            default=1, help='number of build workers',
+                            type=int)
+        parser.add_argument('--upload-workers', dest='upload_workers',
+                            default=4, help='number of upload workers',
+                            type=int)
         self.args = parser.parse_args()
 
     def main(self):
         self.setup_logging()
-        self.nb = builder.NodePoolBuilder(self.args.config)
+        self.nb = builder.NodePoolBuilder(
+            self.args.config, self.args.build_workers,
+            self.args.upload_workers)
 
         signal.signal(signal.SIGINT, self.sigint_handler)
 
-        self.nb.runForever()
+        nb_thread = threading.Thread(target=self.nb.runForever)
+        nb_thread.start()
+
+        while True:
+            signal.pause()
 
 
 def main():
