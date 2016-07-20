@@ -232,7 +232,7 @@ class ProviderManager(TaskManager):
     def waitForServer(self, server, timeout=3600):
         with shade_inner_exceptions():
             return self._client.wait_for_server(
-                server=server, auto_ip=True, reuse=False,
+                server=server, auto_ip=False, reuse=False,
                 timeout=timeout)
 
     def waitForServerDeletion(self, server_id, timeout=600):
