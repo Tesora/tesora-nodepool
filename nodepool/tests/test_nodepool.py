@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gear
 import json
 import logging
 import threading
@@ -216,7 +215,37 @@ class TestNodepool(tests.DBTestCase):
             snapshot_images = session.getSnapshotImages()
             self.assertEqual(len(snapshot_images), 1)
             snap_id = snapshot_images[0].id
-            pool.deleteImage(snap_id)
+            pool.deleteImage(snap_id, force=False)
+
+        self.wait_for_threads()
+
+        with pool.getDB().getSession() as session:
+            while True:
+                snap_image = session.getSnapshotImage(snap_id)
+                if snap_image is None:
+                    break
+                time.sleep(.2)
+
+    def test_dib_snapimage_force_delete(self):
+        """Test that a dib image (snapshot) can be forcibily deleted."""
+        configfile = self.setup_config('node_dib.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
+        pool.start()
+        self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
+        self.waitForNodes(pool)
+        snap_id = None
+
+        with pool.getDB().getSession() as session:
+            snapshot_images = session.getSnapshotImages()
+            self.assertEqual(len(snapshot_images), 1)
+            snap_id = snapshot_images[0].id
+            # delete the provider in the config, simulating us
+            # removing a provider but forgetting to remove existing
+            # images; then force the delete.
+            print pool.config.providers
+            pool.config.providers.pop(snapshot_images[0].provider_name)
+            pool.deleteImage(snap_id, force=True)
 
         self.wait_for_threads()
 
@@ -273,6 +302,41 @@ class TestNodepool(tests.DBTestCase):
                 self.assertEqual(len(node.subnodes), 2)
                 for subnode in node.subnodes:
                     self.assertEqual(subnode.state, nodedb.READY)
+
+    def test_subnode_deletion_success(self):
+        """Test that subnodes are deleted with parent node"""
+        configfile = self.setup_config('subnodes.yaml')
+        pool = self.useNodepool(configfile, watermark_sleep=1)
+        pool.start()
+        self.waitForImage(pool, 'fake-provider', 'fake-image')
+        self.waitForNodes(pool)
+
+        subnode_ids = []
+        node_ids = []
+
+        with pool.getDB().getSession() as session:
+            nodes = session.getNodes(provider_name='fake-provider',
+                                     label_name='multi-fake',
+                                     target_name='fake-target',
+                                     state=nodedb.READY)
+            self.assertEqual(len(nodes), 2)
+            for node in nodes:
+                self.assertEqual(len(node.subnodes), 2)
+                for subnode in node.subnodes:
+                    self.assertEqual(subnode.state, nodedb.READY)
+                    subnode_ids.append(subnode.id)
+                node_ids.append(node.id)
+
+        for node_id in node_ids:
+            pool.deleteNode(node_id)
+
+        self.wait_for_threads()
+        self.waitForNodes(pool)
+
+        with pool.getDB().getSession() as session:
+            for subnode_id in subnode_ids:
+                s = session.getSubNode(subnode_id)
+                self.assertIsNone(s)
 
     def test_node_az(self):
         """Test that an image and node are created with az specified"""
@@ -693,81 +757,63 @@ class TestNodepool(tests.DBTestCase):
             node = session.getNode(2)
             self.assertEqual(node, None)
 
-    def test_no_label_gearman_demand(self):
-        """Test that labelless demand is calculated properly"""
-        configfile = self.setup_config('node.yaml')
+    def test_dont_delete_building_dib_images(self):
+        """Test we don't delete building dib images"""
+        # Get a valid image
+        configfile = self.setup_config('node_dib.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
-        self.waitForImage(pool, 'fake-provider', 'fake-image')
+        self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
         self.waitForNodes(pool)
+        timeout = nodepool.nodepool.IMAGE_CLEANUP
+
+        # Modify the image to be BUILDING and have a state time older
+        # than the cleanup time.
         with pool.getDB().getSession() as session:
-            nodes = session.getNodes(provider_name='fake-provider',
-                                     label_name='fake-label',
-                                     target_name='fake-target',
-                                     state=nodedb.READY)
-            self.assertEqual(len(nodes), 1)
-            nodename = nodes[0].nodename
+            dib_image = session.getDibImage(1)
+            dib_image.state = nodedb.BUILDING
+            dib_image.state_time = time.time() - timeout - 1
+            session.commit()
 
-        worker = gear.Worker(nodename)
-        worker.addServer('localhost', self.gearman_server.port)
-        worker.registerFunction('build:foo')
-        client = gear.Client()
-        client.addServer('localhost', self.gearman_server.port)
-        client.waitForServer()
-        job1 = gear.Job('build:foo', '1')
-        job2 = gear.Job('build:foo', '2')
-        # Create 2 demand for fake-label via job foo registration
-        client.submitJob(job1)
-        client.submitJob(job2)
-        self.waitForNodes(pool)
+            # Run cleanup which should not delete the building image
+            pool.cleanupOneDibImage(session, dib_image)
 
+        # Check that the image is still present in a new session
         with pool.getDB().getSession() as session:
-            nodes = session.getNodes(provider_name='fake-provider',
-                                     label_name='fake-label',
-                                     target_name='fake-target',
-                                     state=nodedb.READY)
-            # 1 (min ready) + 2 (demand)
-            self.assertEqual(len(nodes), 3)
-        client.shutdown()
+            dib_image = session.getDibImage(1)
+            self.assertEqual(dib_image.state, nodedb.BUILDING)
+            self.assertTrue(time.time() - dib_image.state_time > timeout)
 
-    def test_label_gearman_demand(self):
-        """Test that labeled demand is calculated properly"""
-        configfile = self.setup_config('node.yaml')
+    def test_dont_delete_building_snap_images(self):
+        """Test we don't delete building snapshot images"""
+        # Get a valid image
+        configfile = self.setup_config('node_dib.yaml')
         pool = self.useNodepool(configfile, watermark_sleep=1)
+        self._useBuilder(configfile)
         pool.start()
-        self.waitForImage(pool, 'fake-provider', 'fake-image')
+        # Because this builds a dib image we also get a snapshot entry
+        # for the uploaded cloud provider image.
+        self.waitForImage(pool, 'fake-dib-provider', 'fake-dib-image')
         self.waitForNodes(pool)
+        timeout = nodepool.nodepool.IMAGE_CLEANUP
+
+        # Modify the image to be BUILDING and have a state time older
+        # than the cleanup time.
         with pool.getDB().getSession() as session:
-            nodes = session.getNodes(provider_name='fake-provider',
-                                     label_name='fake-label',
-                                     target_name='fake-target',
-                                     state=nodedb.READY)
-            self.assertEqual(len(nodes), 1)
-            nodename = nodes[0].nodename
+            snap_image = session.getSnapshotImage(1)
+            snap_image.state = nodedb.BUILDING
+            snap_image.state_time = time.time() - timeout - 1
+            session.commit()
 
-        worker = gear.Worker(nodename)
-        worker.addServer('localhost', self.gearman_server.port)
-        worker.registerFunction('build:foo')
-        worker.registerFunction('build:foo:fake-label')
-        client = gear.Client()
-        client.addServer('localhost', self.gearman_server.port)
-        client.waitForServer()
-        job1 = gear.Job('build:foo:fake-label', '1')
-        job2 = gear.Job('build:foo:fake-label', '2')
-        # Create 2 demand for fake-label via job foo registration
-        client.submitJob(job1)
-        client.submitJob(job2)
-        self.waitForNodes(pool)
+            # Run cleanup which should not delete the building image
+            pool.cleanupOneImage(session, snap_image)
 
+        # Check that the image is still present in a new session
         with pool.getDB().getSession() as session:
-            nodes = session.getNodes(provider_name='fake-provider',
-                                     label_name='fake-label',
-                                     target_name='fake-target',
-                                     state=nodedb.READY)
-            # 1 (min ready) + 2 (demand)
-            self.assertEqual(len(nodes), 3)
-        client.shutdown()
-
+            snap_image = session.getSnapshotImage(1)
+            self.assertEqual(snap_image.state, nodedb.BUILDING)
+            self.assertTrue(time.time() - snap_image.state_time > timeout)
 
 class TestGearClient(tests.DBTestCase):
     def test_wait_for_completion(self):

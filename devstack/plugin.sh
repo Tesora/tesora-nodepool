@@ -16,6 +16,8 @@
 
 NODEPOOL_KEY=$HOME/.ssh/id_nodepool
 NODEPOOL_PUBKEY=$HOME/.ssh/id_nodepool.pub
+NODEPOOL_INSTALL=$HOME/nodepool-venv
+NODEPOOL_CACHE_GET_PIP=/opt/stack/cache/files/get-pip.py
 
 # Install shade from git if requested. If not requested
 # nodepool install will pull it in.
@@ -25,16 +27,35 @@ function install_shade {
         GITDIR["shade"]=$DEST/shade
         GITBRANCH["shade"]=$SHADE_REPO_REF
         git_clone_by_name "shade"
+        # Install shade globally, because the job config has LIBS_FROM_GIT
+        # and if we don't install it globally, all hell breaks loose
         setup_dev_lib "shade"
+        # BUT - install shade into a virtualenv so that we don't have issues
+        # with OpenStack constraints affecting the shade dependency install.
+        # This particularly shows up with os-client-config
+        $NODEPOOL_INSTALL/bin/pip install -e $DEST/shade
+    fi
+}
+
+function install_diskimage_builder {
+    if use_library_from_git "diskimage-builder"; then
+        GITREPO["diskimage-builder"]=$DISKIMAGE_BUILDER_REPO_URL
+        GITDIR["diskimage-builder"]=$DEST/diskimage-builder
+        GITBRANCH["diskimage-builder"]=$DISKIMAGE_BUILDER_REPO_REF
+        git_clone_by_name "diskimage-builder"
+        setup_dev_lib "diskimage-builder"
+        $NODEPOOL_INSTALL/bin/pip install -e $DEST/diskimage-builder
     fi
 }
 
 # Install nodepool code
 function install_nodepool {
-    # This function is currently blank because just installing a git
-    # tree does not require any additional code
+    virtualenv $NODEPOOL_INSTALL
     install_shade
+    install_diskimage_builder
+
     setup_develop $DEST/nodepool
+    $NODEPOOL_INSTALL/bin/pip install -e $DEST/nodepool
 }
 
 # requires some globals from devstack, which *might* not be stable api
@@ -230,12 +251,18 @@ diskimages:
       DIB_DISABLE_APT_CLEANUP: '1'
       DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
 EOF
+    if [ -f $NODEPOOL_CACHE_GET_PIP ] ; then
+        cat >> /tmp/nodepool.yaml <<EOF
+      DIB_REPOLOCATION_pip_and_virtualenv: file://$NODEPOOL_CACHE_GET_PIP
+EOF
+    fi
 
     sudo mv /tmp/nodepool.yaml $NODEPOOL_CONFIG
     cp /etc/openstack/clouds.yaml /tmp
     cat >>/tmp/clouds.yaml <<EOF
 cache:
   expiration:
+    floating-ip: 5
     server: 5
     port: 5
 EOF
@@ -277,16 +304,18 @@ function start_nodepool {
              secgroup-add-rule default udp 1 65535 0.0.0.0/0
     fi
 
+    export PATH=$NODEPOOL_INSTALL/bin:$PATH
+
     # start gearman server
-    run_process geard "geard -p 8991 -d"
+    run_process geard "$NODEPOOL_INSTALL/bin/geard -p 8991 -d"
 
     # run a fake statsd so we test stats sending paths
     export STATSD_HOST=localhost
     export STATSD_PORT=8125
     run_process statsd "socat -u udp-recv:$STATSD_PORT -"
 
-    run_process nodepool "nodepoold --no-builder -c $NODEPOOL_CONFIG -s $NODEPOOL_SECURE -l $NODEPOOL_LOGGING -d"
-    run_process nodepool-builder "nodepool-builder -c $NODEPOOL_CONFIG -d"
+    run_process nodepool "$NODEPOOL_INSTALL/bin/nodepoold --no-builder -c $NODEPOOL_CONFIG -s $NODEPOOL_SECURE -l $NODEPOOL_LOGGING -d"
+    run_process nodepool-builder "$NODEPOOL_INSTALL/bin/nodepool-builder -c $NODEPOOL_CONFIG -d"
     :
 }
 

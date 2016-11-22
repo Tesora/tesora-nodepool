@@ -26,14 +26,14 @@ import subprocess
 import threading
 import tempfile
 import time
+import uuid
 
 import fixtures
 import gear
 import kazoo.client
-import testresources
 import testtools
 
-from nodepool import allocation, builder, fakeprovider, nodepool, nodedb
+from nodepool import allocation, builder, fakeprovider, nodepool, nodedb, webapp
 
 TRUE_VALUES = ('true', '1', 'yes')
 
@@ -113,10 +113,9 @@ class GearmanServerFixture(fixtures.Fixture):
 class ZookeeperServerFixture(fixtures.Fixture):
     def __init__(self, port=0):
         self._port = port
+        self.log = logging.getLogger("tests.ZookeeperServerFixture")
 
-    def setUp(self):
-        super(ZookeeperServerFixture, self).setUp()
-
+    def _setUp(self):
         if 'NODEPOOL_ZK_HOST' in os.environ:
            if ':' in os.environ['NODEPOOL_ZK_HOST']:
                host, port = os.environ['NODEPOOL_ZK_HOST'].split(':')
@@ -175,11 +174,15 @@ class ZookeeperServerFixture(fixtures.Fixture):
 
         found_port = False
 
+        self.zookeeper_process = None
+        self.addCleanup(self.shutdownZookeeper)
+
         # Try a random port in the local port range one at a time
         # until we find one that's available.
         while not found_port:
             port = random.randrange(begin, end)
 
+            self.log.debug("Starting ZK on port %s", port)
             # Write a config file with this port.
             with open(os.path.join(zookeeper_fixtures, 'zoo.cfg')) as i:
                 with open(config_path, 'w') as o:
@@ -188,6 +191,9 @@ class ZookeeperServerFixture(fixtures.Fixture):
 
             # Run zookeeper.
             p = subprocess.Popen(args)
+            self.zookeeper_port = port
+            self.zookeeper_process = p
+            self.zookeeper_log_path = log_path
 
             # Wait up to 30 seconds to figure out if it has started.
             for x in range(30):
@@ -202,26 +208,39 @@ class ZookeeperServerFixture(fixtures.Fixture):
             if not found_port:
                 p.kill()
                 p.wait()
-
-        if found_port:
-            self.zookeeper_port = port
-            self.zookeeper_process = p
-            self.addCleanup(self.shutdownZookeeper)
+                if os.path.exists(log_path):
+                    os.unlink(log_path)
 
     def _checkZKLog(self, path):
         if not os.path.exists(path):
             return None
+        # Our return value starts as indeterminate.
+        bound = None
         with open(path) as f:
             for line in f:
-                if 'Snapshotting:' in line:
-                    return True
+                # Note: success appears as "binding to port" when
+                # *not* followed by "Address already in use".  That
+                # makes this a little racy, but failure is generally
+                # fast, and this is called at 1 second intervals.
+                if 'binding to port' in line:
+                    bound = True
                 if 'Address already in use' in line:
                     return False
-        return None
+        return bound
 
     def shutdownZookeeper(self):
-        self.zookeeper_process.kill()
-        self.zookeeper_process.wait()
+        if self.zookeeper_process:
+            try:
+                self.zookeeper_process.kill()
+                self.zookeeper_process.wait()
+            except OSError:
+                self.log.exception("Error stopping ZK (ignored)")
+                pass
+        if os.path.exists(self.zookeeper_log_path):
+            self.log.debug("Zookeeper log file:")
+            with open(self.zookeeper_log_path) as f:
+                for line in f:
+                    self.log.debug(line.strip())
 
 
 class GearmanClient(gear.Client):
@@ -255,7 +274,7 @@ class GearmanClient(gear.Client):
         return queued
 
 
-class BaseTestCase(testtools.TestCase, testresources.ResourcedTestCase):
+class BaseTestCase(testtools.TestCase):
     def setUp(self):
         super(BaseTestCase, self).setUp()
         test_timeout = os.environ.get('OS_TEST_TIMEOUT', 60)
@@ -333,6 +352,9 @@ class BaseTestCase(testtools.TestCase, testresources.ResourcedTestCase):
                 if t.name.startswith("Thread-"):
                     # apscheduler thread pool
                     continue
+                if t.name.startswith("worker "):
+                    # paste web server
+                    continue
                 if t.name not in whitelist:
                     done = False
             if done:
@@ -377,17 +399,21 @@ class MySQLSchemaFixture(fixtures.Fixture):
                                             string.ascii_uppercase)
                               for x in range(8))
         self.name = '%s_%s' % (random_bits, os.getpid())
+        self.passwd = uuid.uuid4().hex
         db = pymysql.connect(host="localhost",
                              user="openstack_citest",
                              passwd="openstack_citest",
                              db="openstack_citest")
         cur = db.cursor()
         cur.execute("create database %s" % self.name)
-        cur.execute("grant all on %s.* to '%s'@'localhost'" %
-                    (self.name, self.name))
+        cur.execute(
+            "grant all on %s.* to '%s'@'localhost' identified by '%s'" %
+            (self.name, self.name, self.passwd))
         cur.execute("flush privileges")
 
-        self.dburi = 'mysql+pymysql://%s@localhost/%s' % (self.name, self.name)
+        self.dburi = 'mysql+pymysql://%s:%s@localhost/%s' % (self.name,
+                                                             self.passwd,
+                                                             self.name)
         self.addDetail('dburi', testtools.content.text_content(self.dburi))
         self.addCleanup(self.cleanup)
 
@@ -398,6 +424,8 @@ class MySQLSchemaFixture(fixtures.Fixture):
                              db="openstack_citest")
         cur = db.cursor()
         cur.execute("drop database %s" % self.name)
+        cur.execute("drop user '%s'@'localhost'" % self.name)
+        cur.execute("flush privileges")
 
 
 class BuilderFixture(fixtures.Fixture):
@@ -498,12 +526,18 @@ class DBTestCase(BaseTestCase):
 
         while client.get_queued_image_jobs() > 0:
             time.sleep(.2)
+        client.shutdown()
 
     def useNodepool(self, *args, **kwargs):
         args = (self.secure_conf,) + args
         pool = nodepool.NodePool(*args, **kwargs)
         self.addCleanup(pool.stop)
         return pool
+
+    def useWebApp(self, *args, **kwargs):
+        app = webapp.WebApp(*args, **kwargs)
+        self.addCleanup(app.stop)
+        return app
 
     def _useBuilder(self, configfile):
         self.useFixture(BuilderFixture(configfile))
@@ -521,11 +555,20 @@ class ZKTestCase(BaseTestCase):
         self.useFixture(f)
         self.zookeeper_host = f.zookeeper_host
         self.zookeeper_port = f.zookeeper_port
-        self.chroot_path = "/nodepool_test/%s" % self.getUniqueInteger()
+        # Make sure the test chroot paths do not conflict
+        random_bits = ''.join(random.choice(string.ascii_lowercase +
+                                            string.ascii_uppercase)
+                              for x in range(8))
+        rand_test_path = '%s_%s' % (random_bits, os.getpid())
+        self.chroot_path = "/nodepool_test/%s" % rand_test_path
 
-        # Ensure the chroot path exists and clean up an pre-existing znodes
+        # Ensure the chroot path exists and clean up an pre-existing znodes.
+        # Allow extra time for the very first connection because we might
+        # be waiting for the ZooKeeper server to be started from the
+        # ZookeeperServerFixture fixture.
         _tmp_client = kazoo.client.KazooClient(
-            hosts='%s:%s' % (self.zookeeper_host, self.zookeeper_port))
+            hosts='%s:%s' % (self.zookeeper_host, self.zookeeper_port),
+            timeout=60)
         _tmp_client.start()
 
         if _tmp_client.exists(self.chroot_path):

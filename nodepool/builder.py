@@ -138,6 +138,9 @@ class UploadWorker(BaseWorker):
                 image_name = args['image-name']
                 image_id = job.name.split(':')[1]
                 try:
+                    self.nplog.info("Uploading dib image id:%s provider:%s "
+                                    "name:%s" % (image_id, args['provider'],
+                                                 image_name))
                     external_id = self.builder.uploadImage(image_id,
                                                            args['provider'],
                                                            image_name)
@@ -316,6 +319,10 @@ class NodePoolBuilder(object):
         self.log.info("Deleted dib image id: %s" % image_id)
 
     def uploadImage(self, image_id, provider_name, image_name):
+
+        log = logging.getLogger("nodepool.image.upload.%s" %
+                                (provider_name,))
+
         start_time = time.time()
         timestamp = int(start_time)
 
@@ -325,8 +332,8 @@ class NodePoolBuilder(object):
         image_files = DibImageFile.from_image_id(self._config.imagesdir,
                                                  image_id)
         for f in image_files:
-            self.log.debug("Found image file of type %s for image id: %s" %
-                           (f.extension, f.image_id))
+            log.debug("Found image file of type %s for image id: %s" %
+                      (f.extension, f.image_id))
         image_files = filter(lambda x: x.extension == image_type, image_files)
         if len(image_files) == 0:
             raise exceptions.BuilderInvalidCommandError(
@@ -344,11 +351,12 @@ class NodePoolBuilder(object):
                                       with_extension=True)
 
         dummy_image = type('obj', (object,),
-                           {'name': image_name})
+                           {'name': image_name,
+                            'id': image_id})
         ext_image_name = provider.template_hostname.format(
             provider=provider, image=dummy_image, timestamp=str(timestamp))
-        self.log.info("Uploading dib image id: %s from %s in %s" %
-                      (image_id, filename, provider.name))
+        log.info("Uploading dib image %s (id:%s) from %s in %s" %
+                 (image_name, image_id, filename, provider.name))
 
         manager = self._config.provider_managers[provider.name]
         try:
@@ -359,10 +367,17 @@ class NodePoolBuilder(object):
             )
         image_meta = provider_image.meta
         # uploadImage is synchronous
-        external_id = manager.uploadImage(
-            ext_image_name, filename,
-            image_type=image_file.extension,
-            meta=image_meta)
+        try:
+            external_id = manager.uploadImage(
+                ext_image_name, filename,
+                image_type=image_file.extension,
+                meta=image_meta)
+        except Exception:
+            # note this is intended duplication with UploadWorker, as
+            # self.log here likely redirected to it's own file.
+            log.exception('Exception while uploading image %s (id:%s)'
+                          % (image_name, image_id))
+            raise
 
         if self.statsd:
             dt = int((time.time() - start_time) * 1000)
@@ -371,8 +386,8 @@ class NodePoolBuilder(object):
             self.statsd.timing(key, dt)
             self.statsd.incr(key)
 
-        self.log.info("Image id: %s in %s is ready" % (image_id,
-                                                       provider.name))
+        log.info("Image %s (id:%s) in %s is ready" % (image_name, image_id,
+                                                      provider.name))
         return external_id
 
     def _runDibForImage(self, image, filename):
@@ -436,6 +451,20 @@ class NodePoolBuilder(object):
             raise exceptions.DibFailedError(
                 "DIB failed creating %s" % filename
             )
+
+        if self.statsd:
+            # record stats on the size of each image we create
+            for ext in img_types.split(','):
+                key = 'nodepool.dib_image_build.%s.%s.size' % (image.name, ext)
+                # A bit tricky because these image files may be sparse
+                # files; we only want the true size of the file for
+                # purposes of watching if we've added too much stuff
+                # into the image.  Note that st_blocks is defined as
+                # 512-byte blocks by stat(2)
+                size = os.stat("%s.%s" % (filename, ext)).st_blocks * 512
+                self.log.debug("%s created image %s.%s (size: %d) " %
+                               (image.name, filename, ext, size))
+                self.statsd.gauge(key, size)
 
     def _getDiskimageByName(self, name):
         for image in self._config.diskimages.values():
