@@ -131,7 +131,7 @@ class TestNodepoolBuilder(tests.DBTestCase):
         with pool.getDB().getSession() as session:
             images = session.getSnapshotImages()
             self.assertEqual(len(images), 1)
-            pool.deleteImage(images[0].id)
+            pool.deleteImage(images[0].id, force=False)
 
         # Now wait for image uploads to fail at least once
         # cycling out the existing snap image and making a new one
@@ -147,7 +147,3 @@ class TestNodepoolBuilder(tests.DBTestCase):
                     # We failed to upload first_fail_id and have
                     # moved onto another upload that will fail.
                     break
-
-class TestZookeeper(tests.ZKTestCase):
-    def test_zk(self):
-        self.zkclient.get('/')

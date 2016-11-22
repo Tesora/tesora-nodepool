@@ -266,39 +266,11 @@ class GearmanClient(gear.Client):
         super(GearmanClient, self).__init__(client_id='nodepool')
         self.__log = logging.getLogger("nodepool.GearmanClient")
 
-    def getNeededWorkers(self, session):
+    def getNeededWorkers(self):
         needed_workers = {}
-        function_worker_map = {}
+        job_worker_map = {}
+        unspecified_jobs = {}
         for connection in self.active_connections:
-            try:
-                req = gear.WorkersAdminRequest()
-                connection.sendAdminRequest(req, timeout=300)
-            except Exception:
-                self.__log.exception("Exception while listing workers")
-                self._lostConnection(connection)
-                continue
-            # Populate function_worker_map here
-            for line in req.response.split('\n'):
-                parts = [x.strip() for x in line.split(':', 1)]
-                # parts[0] - Connection details
-                # parts[1] - Functions that remote connection can execute
-                if len(parts) < 2 or not parts[0] or parts[0] == '.':
-                    # Skip if end of response or if no functions list.
-                    continue
-                (conn_fd, remote_ip, nodename) = parts[0].split(None, 2)
-                # Not every worker reg has build: functions so filter
-                # and only handle those entries.
-                functions = [x[len('build:'):]
-                             for x in parts[1].split()
-                             if x.startswith('build:')]
-                if functions:
-                    node = session.getNodeByNodename(nodename)
-                    if node:
-                        worker = node.label_name
-                        for function in functions:
-                            workers = function_worker_map.setdefault(function,
-                                                                     set())
-                            workers.add(worker)
             try:
                 req = gear.StatusAdminRequest()
                 connection.sendAdminRequest(req, timeout=300)
@@ -334,18 +306,29 @@ class GearmanClient(gear.Client):
                 if queued > 0:
                     self.__log.debug("Function: %s queued: %s" % (function,
                                                                   queued))
-                workers = function_worker_map.get(function)
-                # We assume worker was populated by function_worker_map
-                # fillout above in the workers status parsing.
-                if not workers:
-                    continue
-                # Get worker for use in populating needed_workers.
-                # Set pop removes entries so we add it back in after popping.
-                worker = workers.pop()
-                workers.add(worker)
-                if queued > 0:
-                    needed_workers[worker] = (
-                        needed_workers.get(worker, 0) + queued)
+                if ':' in function:
+                    fparts = function.split(':')
+                    # fparts[0] - function name
+                    # fparts[1] - target node [type]
+                    job = fparts[-2]
+                    worker = fparts[-1]
+                    workers = job_worker_map.get(job, [])
+                    workers.append(worker)
+                    job_worker_map[job] = workers
+                    if queued > 0:
+                        needed_workers[worker] = (
+                            needed_workers.get(worker, 0) + queued)
+                elif queued > 0:
+                    job = function
+                    unspecified_jobs[job] = (unspecified_jobs.get(job, 0) +
+                                             queued)
+        for job, queued in unspecified_jobs.items():
+            workers = job_worker_map.get(job)
+            if not workers:
+                continue
+            worker = workers[0]
+            needed_workers[worker] = (needed_workers.get(worker, 0) +
+                                      queued)
         return needed_workers
 
     def handleWorkComplete(self, packet):
@@ -896,17 +879,18 @@ class SubNodeLauncher(threading.Thread):
 class ImageDeleter(threading.Thread):
     log = logging.getLogger("nodepool.ImageDeleter")
 
-    def __init__(self, nodepool, snap_image_id):
+    def __init__(self, nodepool, snap_image_id, force):
         threading.Thread.__init__(self,
                                   name='ImageDeleter for %s' % snap_image_id)
         self.snap_image_id = snap_image_id
+        self.force = force
         self.nodepool = nodepool
 
     def run(self):
         try:
             with self.nodepool.getDB().getSession() as session:
                 snap_image = session.getSnapshotImage(self.snap_image_id)
-                self.nodepool._deleteImage(session, snap_image)
+                self.nodepool._deleteImage(session, snap_image, self.force)
         except Exception:
             self.log.exception("Exception deleting image %s:" %
                                self.snap_image_id)
@@ -1146,11 +1130,15 @@ class SnapshotImageUpdater(ImageUpdater):
 class NodePool(threading.Thread):
     log = logging.getLogger("nodepool.NodePool")
 
-    def __init__(self, securefile, configfile,
+    def __init__(self, securefile, configfile, no_deletes=False,
+                 no_launches=False, no_images=False,
                  watermark_sleep=WATERMARK_SLEEP):
         threading.Thread.__init__(self, name='NodePool')
         self.securefile = securefile
         self.configfile = configfile
+        self.no_deletes = no_deletes
+        self.no_launches = no_launches
+        self.no_images = no_images
         self.watermark_sleep = watermark_sleep
         self._stopped = False
         self.config = None
@@ -1267,14 +1255,16 @@ class NodePool(threading.Thread):
                     second = None
                 minute, hour, dom, month, dow = parts[:5]
                 trigger = apscheduler.triggers.cron.CronTrigger(
-                    day=dom, day_of_week=dow, hour=hour, minute=minute,
-                    second=second)
+                    month=month, day=dom, day_of_week=dow,
+                    hour=hour, minute=minute, second=second)
                 c.job = self.apsched.add_job(
                     cron_map[c.name], trigger=trigger)
             else:
                 c.job = self.config.crons[c.name].job
 
     def reconfigureUpdateListeners(self, config):
+        if self.no_deletes:
+            return
         if self.config:
             running = set(self.config.zmq_publishers.keys())
         else:
@@ -1340,7 +1330,7 @@ class NodePool(threading.Thread):
         self.log.debug("Beginning node launch calculation")
         # Get the current demand for nodes.
         if self.gearman_client:
-            label_demand = self.gearman_client.getNeededWorkers(session)
+            label_demand = self.gearman_client.getNeededWorkers()
         else:
             label_demand = {}
 
@@ -1520,20 +1510,23 @@ class NodePool(threading.Thread):
         # after a restart.  To clean up, mark all building node and
         # images for deletion when the daemon starts.
         with self.getDB().getSession() as session:
-            for node in session.getNodes(state=nodedb.BUILDING):
-                self.log.info("Setting building node id: %s to delete "
-                              "on startup" % node.id)
-                node.state = nodedb.DELETE
+            if not self.no_deletes:
+                for node in session.getNodes(state=nodedb.BUILDING):
+                    self.log.info("Setting building node id: %s to delete "
+                                  "on startup" % node.id)
+                    node.state = nodedb.DELETE
 
-            for image in session.getSnapshotImages(state=nodedb.BUILDING):
-                self.log.info("Setting building image id: %s to delete "
-                              "on startup" % image.id)
-                image.state = nodedb.DELETE
+            if not self.no_images:
+                for image in session.getSnapshotImages(state=nodedb.BUILDING):
+                    self.log.info("Setting building image id: %s to delete "
+                                  "on startup" % image.id)
+                    image.state = nodedb.DELETE
 
-            for dib_image in session.getDibImages(state=nodedb.BUILDING):
-                self.log.info("Setting building dib image id: %s to delete "
-                              "on startup" % dib_image.id)
-                dib_image.state = nodedb.DELETE
+            if not self.no_images:
+                for dib_image in session.getDibImages(state=nodedb.BUILDING):
+                    self.log.info("Setting building dib image id: %s to delete "
+                                  "on startup" % dib_image.id)
+                    dib_image.state = nodedb.DELETE
 
     def run(self):
         try:
@@ -1553,6 +1546,8 @@ class NodePool(threading.Thread):
             self._wake_condition.release()
 
     def _run(self, session, allocation_history):
+        if self.no_launches:
+            return
         self.checkForMissingImages(session)
 
         # Make up the subnode deficit first to make sure that an
@@ -1633,6 +1628,8 @@ class NodePool(threading.Thread):
                 self.checkForMissingDiskImage(session, provider, image)
 
     def checkForMissingImages(self, session):
+        if self.no_images:
+            return
         # If we are missing an image, run the image update function
         # outside of its schedule.
         self.log.debug("Checking missing images.")
@@ -1649,6 +1646,8 @@ class NodePool(threading.Thread):
                     self.log.exception("Exception in missing image check:")
 
     def _doUpdateImages(self):
+        if self.no_images:
+            return
         try:
             with self.getDB().getSession() as session:
                 self.updateImages(session)
@@ -1920,7 +1919,7 @@ class NodePool(threading.Thread):
         for subnode in node.subnodes:
             if subnode.external_id:
                 manager.waitForServerDeletion(subnode.external_id)
-                subnode.delete()
+            subnode.delete()
 
         node.delete()
         self.log.info("Deleted node id: %s" % node.id)
@@ -1934,7 +1933,7 @@ class NodePool(threading.Thread):
             self.statsd.incr(key)
         self.updateStats(session, node.provider_name)
 
-    def deleteImage(self, snap_image_id):
+    def deleteImage(self, snap_image_id, force):
         try:
             self._image_delete_threads_lock.acquire()
 
@@ -1947,7 +1946,7 @@ class NodePool(threading.Thread):
 
             if snap_image_id in self._image_delete_threads:
                 return
-            t = ImageDeleter(self, snap_image_id)
+            t = ImageDeleter(self, snap_image_id, force)
             self._image_delete_threads[snap_image_id] = t
             t.start()
             return t
@@ -1956,35 +1955,42 @@ class NodePool(threading.Thread):
         finally:
             self._image_delete_threads_lock.release()
 
-    def _deleteImage(self, session, snap_image):
+    def _deleteImage(self, session, snap_image, force):
         # Delete an image (and its associated server)
         snap_image.state = nodedb.DELETE
-        provider = self.config.providers[snap_image.provider_name]
-        manager = self.getProviderManager(provider)
 
-        if snap_image.server_external_id:
-            try:
-                server = manager.getServer(snap_image.server_external_id)
-                if server:
-                    self.log.debug('Deleting server %s for image id: %s' %
-                                   (snap_image.server_external_id,
-                                    snap_image.id))
-                    manager.cleanupServer(server['id'])
-                    manager.waitForServerDeletion(server['id'])
+        try:
+            provider = self.config.providers[snap_image.provider_name]
+            manager = self.getProviderManager(provider)
+
+            if snap_image.server_external_id:
+                try:
+                    server = manager.getServer(snap_image.server_external_id)
+                    if server:
+                        self.log.debug('Deleting server %s for image id: %s' %
+                                       (snap_image.server_external_id,
+                                        snap_image.id))
+                        manager.cleanupServer(server['id'])
+                        manager.waitForServerDeletion(server['id'])
+                    else:
+                        raise provider_manager.NotFound
+                except provider_manager.NotFound:
+                    self.log.warning('Image server id %s not found' %
+                                     snap_image.server_external_id)
+
+            if snap_image.external_id:
+                remote_image = manager.getImage(snap_image.external_id)
+                if remote_image is None:
+                    self.log.warning('Image id %s not found' %
+                                     snap_image.external_id)
                 else:
-                    raise provider_manager.NotFound
-            except provider_manager.NotFound:
-                self.log.warning('Image server id %s not found' %
-                                 snap_image.server_external_id)
-
-        if snap_image.external_id:
-            remote_image = manager.getImage(snap_image.external_id)
-            if remote_image is None:
-                self.log.warning('Image id %s not found' %
-                                 snap_image.external_id)
+                    self.log.debug('Deleting image %s' % remote_image['id'])
+                    manager.deleteImage(remote_image['id'])
+        except Exception:
+            if not force:
+                raise
             else:
-                self.log.debug('Deleting image %s' % remote_image['id'])
-                manager.deleteImage(remote_image['id'])
+                self.log.info("Ignoring image delete errors")
 
         snap_image.delete()
         self.log.info("Deleted image id: %s" % snap_image.id)
@@ -2021,6 +2027,8 @@ class NodePool(threading.Thread):
         manager.cleanupServer(external_id)
 
     def _doPeriodicCleanup(self):
+        if self.no_deletes:
+            return
         try:
             self.periodicCleanup()
         except Exception:
@@ -2191,6 +2199,7 @@ class NodePool(threading.Thread):
             if len(images) > 1:
                 previous = images[1]
             if (image != current and image != previous and
+                    image.state != nodedb.BUILDING and
                     (now - image.state_time) > IMAGE_CLEANUP):
                 self.log.info("Deleting image id: %s which is "
                               "%s hours old" %
@@ -2199,7 +2208,7 @@ class NodePool(threading.Thread):
                 delete = True
         if delete:
             try:
-                self.deleteImage(image.id)
+                self.deleteImage(image.id, force=False)
             except Exception:
                 self.log.exception("Exception deleting image id: %s:" %
                                    image.id)
@@ -2220,6 +2229,7 @@ class NodePool(threading.Thread):
             if len(images) > 1:
                 previous = images[1]
             if (image != current and image != previous and
+                    image.state != nodedb.BUILDING and
                     (now - image.state_time) > IMAGE_CLEANUP):
                 self.log.info("Deleting image id: %s which is "
                               "%s hours old" %
@@ -2236,6 +2246,8 @@ class NodePool(threading.Thread):
                                    image.id)
 
     def _doPeriodicCheck(self):
+        if self.no_deletes:
+            return
         try:
             with self.getDB().getSession() as session:
                 self.periodicCheck(session)
@@ -2302,7 +2314,8 @@ class NodePool(threading.Thread):
                 continue
             state = nodedb.STATE_NAMES[node.state]
             key = 'nodepool.nodes.%s' % state
-            states[key] += 1
+            total_nodes = self.config.labels[node.label_name].subnodes + 1
+            states[key] += total_nodes
 
             # NOTE(pabelanger): Check if we assign nodes via Gearman if so, use
             # the manager name.
@@ -2316,15 +2329,15 @@ class NodePool(threading.Thread):
             else:
                 key = 'nodepool.target.%s.nodes.%s' % (
                     node.target_name, state)
-            states[key] += 1
+            states[key] += total_nodes
 
             key = 'nodepool.label.%s.nodes.%s' % (
                 node.label_name, state)
-            states[key] += 1
+            states[key] += total_nodes
 
             key = 'nodepool.provider.%s.nodes.%s' % (
                 node.provider_name, state)
-            states[key] += 1
+            states[key] += total_nodes
 
         # NOTE(pabelanger): Initialize other state values to zero if missed
         # above.

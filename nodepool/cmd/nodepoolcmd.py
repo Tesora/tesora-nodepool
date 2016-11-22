@@ -17,10 +17,11 @@
 import argparse
 import logging.config
 import sys
-import time
 
 from nodepool import nodedb
 from nodepool import nodepool
+from nodepool import status
+from nodepool.cmd import NodepoolApp
 from nodepool.version import version_info as npc_version_info
 from config_validator import ConfigValidator
 from prettytable import PrettyTable
@@ -28,18 +29,7 @@ from prettytable import PrettyTable
 log = logging.getLogger(__name__)
 
 
-class NodePoolCmd(object):
-    def __init__(self):
-        self.args = None
-
-    @staticmethod
-    def _age(timestamp):
-        now = time.time()
-        dt = now - timestamp
-        m, s = divmod(dt, 60)
-        h, m = divmod(m, 60)
-        d, h = divmod(h, 24)
-        return '%02d:%02d:%02d:%02d' % (d, h, m, s)
+class NodePoolCmd(NodepoolApp):
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser(description='Node pool.')
@@ -49,6 +39,8 @@ class NodePoolCmd(object):
         parser.add_argument('-s', dest='secure',
                             default='/etc/nodepool/secure.conf',
                             help='path to secure file')
+        parser.add_argument('-l', dest='logconfig',
+                            help='path to log config file')
         parser.add_argument('--version', action='version',
                             version=npc_version_info.version_string(),
                             help='show version')
@@ -122,6 +114,9 @@ class NodePoolCmd(object):
             help='delete an image')
         cmd_image_delete.set_defaults(func=self.image_delete)
         cmd_image_delete.add_argument('id', help='image id')
+        cmd_image_delete.add_argument('--force',
+                                      help='Ignore failure to remove image'
+                                      'from cloud', action='store_true')
 
         cmd_dib_image_delete = subparsers.add_parser(
             'dib-image-delete',
@@ -168,53 +163,21 @@ class NodePoolCmd(object):
             logging.basicConfig(level=logging.DEBUG,
                                 format='%(asctime)s %(levelname)s %(name)s: '
                                        '%(message)s')
+        elif self.args.logconfig:
+            NodepoolApp.setup_logging(self)
         else:
             logging.basicConfig(level=logging.INFO,
                                 format='%(asctime)s %(levelname)s %(name)s: '
                                        '%(message)s')
 
     def list(self, node_id=None):
-        t = PrettyTable(["ID", "Provider", "AZ", "Label", "Target", "Manager",
-                         "Hostname", "NodeName", "Server ID", "IP", "State",
-                         "Age", "Comment"])
-        t.align = 'l'
-        with self.pool.getDB().getSession() as session:
-            for node in session.getNodes():
-                if node_id and node.id != node_id:
-                    continue
-                t.add_row([node.id, node.provider_name, node.az,
-                           node.label_name, node.target_name,
-                           node.manager_name, node.hostname,
-                           node.nodename, node.external_id, node.ip,
-                           nodedb.STATE_NAMES[node.state],
-                           NodePoolCmd._age(node.state_time),
-                           node.comment])
-            print t
+        print status.node_list(self.pool.getDB(), node_id)
 
     def dib_image_list(self):
-        t = PrettyTable(["ID", "Image", "Filename", "Version",
-                         "State", "Age"])
-        t.align = 'l'
-        with self.pool.getDB().getSession() as session:
-            for image in session.getDibImages():
-                t.add_row([image.id, image.image_name,
-                           image.filename, image.version,
-                           nodedb.STATE_NAMES[image.state],
-                           NodePoolCmd._age(image.state_time)])
-            print t
+        print status.dib_image_list(self.pool.getDB())
 
     def image_list(self):
-        t = PrettyTable(["ID", "Provider", "Image", "Hostname", "Version",
-                         "Image ID", "Server ID", "State", "Age"])
-        t.align = 'l'
-        with self.pool.getDB().getSession() as session:
-            for image in session.getSnapshotImages():
-                t.add_row([image.id, image.provider_name, image.image_name,
-                           image.hostname, image.version,
-                           image.external_id, image.server_external_id,
-                           nodedb.STATE_NAMES[image.state],
-                           NodePoolCmd._age(image.state_time)])
-            print t
+        print status.image_list(self.pool.getDB())
 
     def image_update(self):
         threads = []
@@ -382,7 +345,7 @@ class NodePoolCmd(object):
 
     def image_delete(self):
         self.pool.reconfigureManagers(self.pool.config, False)
-        thread = self.pool.deleteImage(self.args.id)
+        thread = self.pool.deleteImage(self.args.id, self.args.force)
         self._wait_for_threads((thread, ))
 
     def config_validate(self):
