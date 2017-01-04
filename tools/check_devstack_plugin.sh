@@ -5,6 +5,15 @@ NODEPOOL_CONFIG=${NODEPOOL_CONFIG:-/etc/nodepool/nodepool.yaml}
 NODEPOOL_SECURE=${NODEPOOL_SECURE:-/etc/nodepool/secure.conf}
 NODEPOOL="$NODEPOOL_INSTALL/bin/nodepool -c $NODEPOOL_CONFIG -s $NODEPOOL_SECURE"
 
+# Flags to control which images we build.
+# NOTE(pabelanger): Be sure to also update devstack/settings if you change the
+# defaults.
+NODEPOOL_PAUSE_CENTOS_7_DIB=${NODEPOOL_PAUSE_CENTOS_7_DIB:-true}
+NODEPOOL_PAUSE_FEDORA_24_DIB=${NODEPOOL_PAUSE_FEDORA_24_DIB:-true}
+NODEPOOL_PAUSE_UBUNTU_PRECISE_DIB=${NODEPOOL_PAUSE_UBUNTU_PRECISE_DIB:-true}
+NODEPOOL_PAUSE_UBUNTU_TRUSTY_DIB=${NODEPOOL_PAUSE_UBUNTU_TRUSTY_DIB:-false}
+NODEPOOL_PAUSE_UBUNTU_XENIAL_DIB=${NODEPOOL_PAUSE_UBUNTU_XENIAL_DIB:-true}
+
 function waitforimage {
     name=$1
     state='ready'
@@ -31,15 +40,40 @@ function waitfornode {
     done
 }
 
-# Check that snapshot image built
-waitforimage trusty-server
-# check that dib image built
-waitforimage ubuntu-dib
+if [ $NODEPOOL_PAUSE_CENTOS_7_DIB = 'false' ]; then
+    # check that image built
+    waitforimage centos-7
+    # check image was bootable
+    waitfornode centos-7
+fi
 
-# check snapshot image was bootable
-waitfornode trusty-server
-# check dib image was bootable
-waitfornode ubuntu-dib
+if [ $NODEPOOL_PAUSE_FEDORA_24_DIB = 'false' ]; then
+    # check that image built
+    waitforimage fedora-24
+    # check image was bootable
+    waitfornode fedora-24
+fi
+
+if [ $NODEPOOL_PAUSE_UBUNTU_PRECISE_DIB = 'false' ]; then
+    # check that image built
+    waitforimage ubuntu-precise
+    # check image was bootable
+    waitfornode ubuntu-precise
+fi
+
+if [ $NODEPOOL_PAUSE_UBUNTU_TRUSTY_DIB = 'false' ]; then
+    # check that image built
+    waitforimage ubuntu-trusty
+    # check image was bootable
+    waitfornode ubuntu-trusty
+fi
+
+if [ $NODEPOOL_PAUSE_UBUNTU_XENIAL = 'false' ]; then
+    # check that image built
+    waitforimage ubuntu-xenial
+    # check image was bootable
+    waitfornode ubuntu-xenial
+fi
 
 set -o errexit
 # Show the built nodes
@@ -47,7 +81,6 @@ $NODEPOOL list
 
 # Try to delete the nodes that were just built
 $NODEPOOL delete --now 1
-$NODEPOOL delete --now 2
 
 # show the deleted nodes (and their replacements may be building)
 $NODEPOOL list

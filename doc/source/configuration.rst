@@ -57,13 +57,12 @@ Following settings are available::
 Nodepool reads its configuration from ``/etc/nodepool/nodepool.yaml``
 by default.  The configuration file follows the standard YAML syntax
 with a number of sections defined with top level keys.  For example, a
-full configuration file may have the ``labels``, ``providers``, and
-``targets`` sections. If building images using diskimage-builder, the
-``diskimages`` section is also required::
+full configuration file may have the ``diskimages``, ``labels``,
+``providers``, and ``targets`` sections::
 
-  labels:
-    ...
   diskimages:
+    ...
+  labels:
     ...
   providers:
     ...
@@ -72,19 +71,6 @@ full configuration file may have the ``labels``, ``providers``, and
 
 The following sections are available.  All are required unless
 otherwise indicated.
-
-script-dir
-----------
-When creating an image to use when launching new nodes, Nodepool will
-run a script that is expected to prepare the machine before the
-snapshot image is created.  The ``script-dir`` parameter indicates a
-directory that holds all of the scripts needed to accomplish this.
-Nodepool will copy the entire directory to the machine before invoking
-the appropriate script for the image being created.
-
-Example::
-
-  script-dir: /path/to/script/dir
 
 .. _elements-dir:
 
@@ -115,17 +101,14 @@ cron
 ----
 This section is optional.
 
-Nodepool runs several periodic tasks.  The ``image-update`` task
-creates a new image for each of the defined images, typically used to
-keep the data cached on the images up to date.  The ``cleanup`` task
-deletes old images and servers which may have encountered errors
-during their initial deletion.  The ``check`` task attempts to log
-into each node that is waiting to be used to make sure that it is
-still operational.  The following illustrates how to change the
-schedule for these tasks and also indicates their default values::
+Nodepool runs several periodic tasks.  The ``cleanup`` task deletes
+old images and servers which may have encountered errors during their
+initial deletion.  The ``check`` task attempts to log into each node
+that is waiting to be used to make sure that it is still operational.
+The following illustrates how to change the schedule for these tasks
+and also indicates their default values::
 
   cron:
-    image-update: '14 2 * * *'
     cleanup: '27 */6 * * *'
     check: '*/15 * * * *'
 
@@ -233,25 +216,42 @@ providers or images are used to create them).  Example::
 diskimages
 ----------
 
-Lists the images that are going to be built using diskimage-builder.
-Image keyword defined on labels section will be mapped to the
-images listed on diskimages. If an entry matching the image is found
-this will be built using diskimage-builder and the settings found
-on this configuration. If no matching image is found, image
-will be built using the provider snapshot approach::
+This section lists the images to be built using diskimage-builder. The
+name of the diskimage is mapped to the :ref:`images` section of the
+provider, to determine which providers should received uploads of each
+image.  The diskimage will be built in every format required by the
+providers with which it is associated.  Because Nodepool needs to know
+which formats to build, if the diskimage will only be built if it
+appears in at least one provider.
+
+To remove a diskimage from the system entirely, remove all associated
+entries in :ref:`images` and remove its entry from `diskimages`
+entirely.  All uploads will be deleted as well as the files on disk.
+
+Example configuration::
 
   diskimages:
-  - name: devstack-precise
-    elements:
-      - ubuntu
-      - vm
-      - puppet
-      - nodepool-base
-      - node-devstack
-    release: precise
-    env-vars:
-        DIB_DISTRIBUTION_MIRROR: http://archive.ubuntu.com
+    - name: ubuntu-precise
+      pause: False
+      rebuild-age: 86400
+      elements:
+        - ubuntu-minimal
+        - vm
+        - simple-init
+        - openstack-repos
+        - nodepool-base
+        - cache-devstack
+        - cache-bindep
+        - growroot
+        - infra-package-needs
+      release: precise
+      env-vars:
+        TMPDIR: /opt/dib_tmp
+        DIB_CHECKSUM: '1'
         DIB_IMAGE_CACHE: /opt/dib_cache
+        DIB_APT_LOCAL_CACHE: '0'
+        DIB_DISABLE_APT_CLEANUP: '1'
+        FS_TYPE: ext3
 
 
 **required**
@@ -260,6 +260,11 @@ will be built using the provider snapshot approach::
     Identifier to reference the disk image in :ref:`images` and :ref:`labels`.
 
 **optional**
+
+  ``rebuild-age``
+    If the current diskimage is older than this value (in seconds),
+    then nodepool will attempt to rebuild it.  Defaults to 86400 (24
+    hours).
 
   ``release``
     Specifies the distro to be used as a base image to build the image using
@@ -273,6 +278,9 @@ will be built using the provider snapshot approach::
   ``env-vars`` (dict)
     Arbitrary environment variables that will be available in the spawned
     diskimage-builder child process.
+
+  ``pause`` (bool)
+    When set to True, nodepool-builder will not build the diskimage.
 
 .. _provider:
 
@@ -301,10 +309,8 @@ provider, the Nodepool image types are also defined (see
           public: True
       images:
         - name: trusty
-          base-image: 'Trusty'
           min-ram: 8192
           name-filter: 'something to match'
-          setup: prepare_node.sh
           username: jenkins
           user-home: '/home/jenkins'
           private-key: /var/lib/jenkins/.ssh/id_rsa
@@ -312,15 +318,12 @@ provider, the Nodepool image types are also defined (see
               key: value
               key2: value
         - name: precise
-          base-image: 'Precise'
           min-ram: 8192
-          setup: prepare_node.sh
           username: jenkins
           user-home: '/home/jenkins'
           private-key: /var/lib/jenkins/.ssh/id_rsa
         - name: devstack-trusty
           min-ram: 30720
-          diskimage: devstack-trusty
           username: jenkins
           private-key: /home/nodepool/.ssh/id_rsa
     - name: provider2
@@ -336,9 +339,7 @@ provider, the Nodepool image types are also defined (see
       template-hostname: '{image.name}-{timestamp}-nodepool-template'
       images:
         - name: precise
-          base-image: 'Fake Precise'
           min-ram: 8192
-          setup: prepare_node.sh
           username: jenkins
           user-home: '/home/jenkins'
           private-key: /var/lib/jenkins/.ssh/id_rsa
@@ -465,14 +466,22 @@ provider, the Nodepool image types are also defined (see
 images
 ~~~~~~
 
-Example::
+Each entry in a provider's `images` section must correspond to an
+entry in :ref:`diskimages`.  Such an entry indicates that the
+corresponding diskimage should be uploaded for use in this provider.
+Additionally, any nodes that are created using the uploaded image will
+have the associated attributes (such as flavor or metadata).
+
+If an image is removed from this section, any previously uploaded
+images will be deleted from the provider.
+
+Example configuration::
 
   images:
     - name: precise
-      base-image: 'Precise'
+      pause: False
       min-ram: 8192
       name-filter: 'something to match'
-      setup: prepare_node.sh
       username: jenkins
       private-key: /var/lib/jenkins/.ssh/id_rsa
       meta:
@@ -482,21 +491,13 @@ Example::
 **required**
 
   ``name``
-    Identifier to refer this image from :ref:`labels` and :ref:`provider`
+    Identifier to refer this image from :ref:`labels` and :ref:`diskimages`
     sections.
 
-    If the resulting images from different providers ``base-image`` should be
-    equivalent, give them the same name; e.g. if one provider has a ``Fedora
-    20`` image and another has an equivalent ``Fedora 20 (Heisenbug)`` image,
-    they should use a common ``name``.  Otherwise select a unique ``name``.
-
-  ``base-image``
-    UUID or string-name of the image to boot as specified by the provider.
-
   ``min-ram``
-    Determine the flavor of ``base-image`` to use (e.g. ``m1.medium``,
-    ``m1.large``, etc).  The smallest flavor that meets the ``min-ram``
-    requirements will be chosen. To further filter by flavor name, see optional
+    Determine the flavor to use (e.g. ``m1.medium``, ``m1.large``,
+    etc).  The smallest flavor that meets the ``min-ram`` requirements
+    will be chosen. To further filter by flavor name, see optional
     ``name-filter`` below.
 
 **optional**
@@ -507,15 +508,9 @@ Example::
     `name-filter` to ``Performance`` will ensure the chosen flavor also
     contains this string as well as meeting `min-ram` requirements).
 
-  ``setup``
-     Script to run to prepare the instance.
-
-     Used only when not building images using diskimage-builder, in that case
-     settings defined in the ``diskimages`` section will be used instead. See
-     :ref:`scripts` for setup script details.
-
-  ``diskimages``
-     See :ref:`diskimages`.
+  ``pause`` (bool)
+    When set to True, nodepool-builder will not upload the image to the
+    provider.
 
   ``username``
     Nodepool expects that user to exist after running the script indicated by
