@@ -48,11 +48,24 @@ function install_diskimage_builder {
     fi
 }
 
+function install_glean {
+    if use_library_from_git "glean"; then
+        GITREPO["glean"]=$GLEAN_REPO_URL
+        GITDIR["glean"]=$DEST/glean
+        GITBRANCH["glean"]=$GLEAN_REPO_REF
+        git_clone_by_name "glean"
+        setup_dev_lib "glean"
+        $NODEPOOL_INSTALL/bin/pip install -e $DEST/glean
+    fi
+}
+
+
 # Install nodepool code
 function install_nodepool {
     virtualenv $NODEPOOL_INSTALL
     install_shade
     install_diskimage_builder
+    install_glean
 
     setup_develop $DEST/nodepool
     $NODEPOOL_INSTALL/bin/pip install -e $DEST/nodepool
@@ -67,32 +80,9 @@ function nodepool_create_keypairs {
     fi
 }
 
-function nodepool_write_prepare {
-    sudo mkdir -p $(dirname $NODEPOOL_CONFIG)/scripts
-    local pub_key=$(cat $NODEPOOL_PUBKEY)
-
-    cat > /tmp/prepare_node_ubuntu.sh <<EOF
-#!/bin/bash -x
-sudo adduser --disabled-password --gecos "" jenkins
-sudo mkdir -p /home/jenkins/.ssh
-cat > tmp_authorized_keys << INNEREOF
-  $pub_key
-INNEREOF
-sudo mv tmp_authorized_keys /home/jenkins/.ssh/authorized_keys
-sudo chmod 700 /home/jenkins/.ssh
-sudo chmod 600 /home/jenkins/.ssh/authorized_keys
-sudo chown -R jenkins:jenkins /home/jenkins
-sleep 5
-sync
-EOF
-    sudo mv /tmp/prepare_node_ubuntu.sh \
-         $(dirname $NODEPOOL_CONFIG)/scripts/prepare_node_ubuntu.sh
-
-    sudo chmod a+x $(dirname $NODEPOOL_CONFIG)/scripts/prepare_node_ubuntu.sh
-
+function nodepool_write_elements {
     sudo mkdir -p $(dirname $NODEPOOL_CONFIG)/elements/nodepool-setup/install.d
     cat > /tmp/01-nodepool-setup <<EOF
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
 sudo mkdir -p /etc/nodepool
 # Make it world writeable so nodepool can write here later.
 sudo chmod 777 /etc/nodepool
@@ -118,7 +108,7 @@ function nodepool_write_config {
 keys=simple
 
 [loggers]
-keys=root,nodepool,shade
+keys=root,nodepool,shade,kazoo
 
 [handlers]
 keys=console
@@ -137,6 +127,12 @@ propagate=0
 level=DEBUG
 handlers=console
 qualname=shade
+propagate=0
+
+[logger_kazoo]
+level=INFO
+handlers=console
+qualname=kazoo
 propagate=0
 
 [handler_console]
@@ -162,11 +158,13 @@ dburi: $dburi
 EOF
     sudo mv /tmp/secure.conf $NODEPOOL_SECURE
 
+    if [ -f $NODEPOOL_CACHE_GET_PIP ] ; then
+        DIB_GET_PIP="DIB_REPOLOCATION_pip_and_virtualenv: file://$NODEPOOL_CACHE_GET_PIP"
+    fi
     cat > /tmp/nodepool.yaml <<EOF
-# You will need to make and populate these two paths as necessary,
+# You will need to make and populate this path as necessary,
 # cloning nodepool does not do this. Further in this doc we have an
-# example script for /path/to/nodepool/things/scripts.
-script-dir: $(dirname $NODEPOOL_CONFIG)/scripts
+# example element.
 elements-dir: $(dirname $NODEPOOL_CONFIG)/elements
 images-dir: $NODEPOOL_DIB_BASE_PATH/images
 # The mysql password here may be different depending on your
@@ -174,6 +172,10 @@ images-dir: $NODEPOOL_DIB_BASE_PATH/images
 # is MYSQL_PASSWORD and if unset devstack should prompt you for
 # the value).
 dburi: '$dburi'
+
+zookeeper-servers:
+  - host: localhost
+    port: 2181
 
 gearman-servers:
   - host: localhost
@@ -188,20 +190,30 @@ targets:
 cron:
   cleanup: '*/1 * * * *'
   check: '*/15 * * * *'
-  image-update: '14 14 * * *'
 
-# Devstack does not make an Ubuntu image by default. You can
-# grab one from Ubuntu and upload it yourself. Note that we
-# cannot use devstack's cirros default because cirros does not
-# support sftp.
 labels:
-  - name: $NODEPOOL_IMAGE
-    image: $NODEPOOL_IMAGE
+  - name: centos-7
+    image: centos-7
     min-ready: 1
     providers:
       - name: devstack
-  - name: ubuntu-dib
-    image: ubuntu-dib
+  - name: fedora-24
+    image: fedora-24
+    min-ready: 1
+    providers:
+      - name: devstack
+  - name: ubuntu-precise
+    image: ubuntu-precise
+    min-ready: 1
+    providers:
+      - name: devstack
+  - name: ubuntu-trusty
+    image: ubuntu-trusty
+    min-ready: 1
+    providers:
+      - name: devstack
+  - name: ubuntu-xenial
+    image: ubuntu-xenial
     min-ready: 1
     providers:
       - name: devstack
@@ -217,45 +229,124 @@ providers:
     max-servers: 2
     rate: 0.25
     images:
-      - name: $NODEPOOL_IMAGE
-        base-image: '$NODEPOOL_IMAGE'
+      - name: centos-7
         min-ram: 1024
-        # This script should setup the jenkins user to accept
-        # the ssh key configured below. It goes in the script-dir
-        # configured above and an example is below.
-        setup: prepare_node_ubuntu.sh
-        username: jenkins
-        # Alter below to point to your local user private key
+        username: devuser
         private-key: $NODEPOOL_KEY
         config-drive: true
-      - name: ubuntu-dib
+      - name: fedora-24
         min-ram: 1024
-        diskimage: ubuntu-dib
+        username: devuser
+        private-key: $NODEPOOL_KEY
+        config-drive: true
+      - name: ubuntu-precise
+        min-ram: 1024
+        username: devuser
+        private-key: $NODEPOOL_KEY
+        config-drive: true
+      - name: ubuntu-trusty
+        min-ram: 1024
+        username: devuser
+        private-key: $NODEPOOL_KEY
+        config-drive: true
+      - name: ubuntu-xenial
+        min-ram: 1024
         username: devuser
         private-key: $NODEPOOL_KEY
         config-drive: true
 
 diskimages:
-  - name: ubuntu-dib
+  - name: centos-7
+    pause: $NODEPOOL_PAUSE_CENTOS_7_DIB
+    rebuild-age: 86400
+    elements:
+      - centos-minimal
+      - vm
+      - simple-init
+      - devuser
+      - openssh-server
+      - nodepool-setup
+    env-vars:
+      TMPDIR: $NODEPOOL_DIB_BASE_PATH/tmp
+      DIB_CHECKSUM: '1'
+      DIB_IMAGE_CACHE: $NODEPOOL_DIB_BASE_PATH/cache
+      DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
+      $DIB_GET_PIP
+  - name: fedora-24
+    pause: $NODEPOOL_PAUSE_FEDORA_24_DIB
+    rebuild-age: 86400
+    elements:
+      - fedora-minimal
+      - vm
+      - simple-init
+      - devuser
+      - openssh-server
+      - nodepool-setup
+    release: 24
+    env-vars:
+      TMPDIR: $NODEPOOL_DIB_BASE_PATH/tmp
+      DIB_CHECKSUM: '1'
+      DIB_IMAGE_CACHE: $NODEPOOL_DIB_BASE_PATH/cache
+      DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
+      $DIB_GET_PIP
+  - name: ubuntu-precise
+    pause: $NODEPOOL_PAUSE_UBUNTU_PRECISE_DIB
+    rebuild-age: 86400
     elements:
       - ubuntu-minimal
       - vm
       - simple-init
       - devuser
+      - openssh-server
       - nodepool-setup
-    release: trusty
+    release: precise
     env-vars:
       TMPDIR: $NODEPOOL_DIB_BASE_PATH/tmp
+      DIB_CHECKSUM: '1'
       DIB_IMAGE_CACHE: $NODEPOOL_DIB_BASE_PATH/cache
       DIB_APT_LOCAL_CACHE: '0'
       DIB_DISABLE_APT_CLEANUP: '1'
       DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
+      $DIB_GET_PIP
+  - name: ubuntu-trusty
+    pause: $NODEPOOL_PAUSE_UBUNTU_TRUSTY_DIB
+    rebuild-age: 86400
+    elements:
+      - ubuntu-minimal
+      - vm
+      - simple-init
+      - devuser
+      - openssh-server
+      - nodepool-setup
+    release: trusty
+    env-vars:
+      TMPDIR: $NODEPOOL_DIB_BASE_PATH/tmp
+      DIB_CHECKSUM: '1'
+      DIB_IMAGE_CACHE: $NODEPOOL_DIB_BASE_PATH/cache
+      DIB_APT_LOCAL_CACHE: '0'
+      DIB_DISABLE_APT_CLEANUP: '1'
+      DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
+      $DIB_GET_PIP
+  - name: ubuntu-xenial
+    pause: $NODEPOOL_PAUSE_UBUNTU_XENIAL_DIB
+    rebuild-age: 86400
+    elements:
+      - ubuntu-minimal
+      - vm
+      - simple-init
+      - devuser
+      - openssh-server
+      - nodepool-setup
+    release: xenial
+    env-vars:
+      TMPDIR: $NODEPOOL_DIB_BASE_PATH/tmp
+      DIB_CHECKSUM: '1'
+      DIB_IMAGE_CACHE: $NODEPOOL_DIB_BASE_PATH/cache
+      DIB_APT_LOCAL_CACHE: '0'
+      DIB_DISABLE_APT_CLEANUP: '1'
+      DIB_DEV_USER_AUTHORIZED_KEYS: $NODEPOOL_PUBKEY
+      $DIB_GET_PIP
 EOF
-    if [ -f $NODEPOOL_CACHE_GET_PIP ] ; then
-        cat >> /tmp/nodepool.yaml <<EOF
-      DIB_REPOLOCATION_pip_and_virtualenv: file://$NODEPOOL_CACHE_GET_PIP
-EOF
-    fi
 
     sudo mv /tmp/nodepool.yaml $NODEPOOL_CONFIG
     cp /etc/openstack/clouds.yaml /tmp
@@ -280,8 +371,8 @@ function configure_nodepool {
     # write the nodepool config
     nodepool_write_config
 
-    # write the prepare node script
-    nodepool_write_prepare
+    # write the elements
+    nodepool_write_elements
 
     # builds a fresh db
     recreate_database nodepool
@@ -315,7 +406,7 @@ function start_nodepool {
     run_process statsd "socat -u udp-recv:$STATSD_PORT -"
 
     run_process nodepool "$NODEPOOL_INSTALL/bin/nodepoold --no-builder -c $NODEPOOL_CONFIG -s $NODEPOOL_SECURE -l $NODEPOOL_LOGGING -d"
-    run_process nodepool-builder "$NODEPOOL_INSTALL/bin/nodepool-builder -c $NODEPOOL_CONFIG -d"
+    run_process nodepool-builder "$NODEPOOL_INSTALL/bin/nodepool-builder -c $NODEPOOL_CONFIG -l $NODEPOOL_LOGGING -d"
     :
 }
 

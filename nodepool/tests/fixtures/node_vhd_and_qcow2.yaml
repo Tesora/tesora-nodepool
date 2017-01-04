@@ -18,23 +18,12 @@ zookeeper-servers:
     chroot: {zookeeper_chroot}
 
 labels:
-  - name: fake-label1
+  - name: fake-label
     image: fake-image
-    min-ready: 1
+    min-ready: 2
     providers:
       - name: fake-provider1
-
-  - name: fake-label2
-    image: fake-image
-    min-ready: 1
-    providers:
       - name: fake-provider2
-
-  - name: fake-label3
-    image: fake-image
-    min-ready: 1
-    providers:
-      - name: fake-provider3
 
 providers:
   - name: fake-provider1
@@ -44,11 +33,11 @@ providers:
     password: 'fake'
     auth-url: 'fake'
     project-id: 'fake'
-    max-servers: 96
+    max-servers: 1
     pool: 'fake'
+    image-type: vhd
     networks:
-      - net-id: 'ipv6-uuid'
-    ipv6-preferred: True
+      - net-id: 'some-uuid'
     rate: 0.0001
     images:
       - name: fake-image
@@ -57,7 +46,6 @@ providers:
         meta:
           key: value
           key2: value
-
   - name: fake-provider2
     region-name: fake-region
     keypair: 'if-present-use-this-keypair'
@@ -65,31 +53,11 @@ providers:
     password: 'fake'
     auth-url: 'fake'
     project-id: 'fake'
-    max-servers: 96
+    max-servers: 1
     pool: 'fake'
-    networks:
-      - net-id: 'ipv6-uuid'
-    rate: 0.0001
-    images:
-      - name: fake-image
-        min-ram: 8192
-        name-filter: 'Fake'
-        meta:
-          key: value
-          key2: value
-
-  - name: fake-provider3
-    region-name: fake-region
-    keypair: 'if-present-use-this-keypair'
-    username: 'fake'
-    password: 'fake'
-    auth-url: 'fake'
-    project-id: 'fake'
-    max-servers: 96
-    pool: 'fake'
+    image-type: qcow2
     networks:
       - net-id: 'some-uuid'
-    ipv6-preferred: True
     rate: 0.0001
     images:
       - name: fake-image

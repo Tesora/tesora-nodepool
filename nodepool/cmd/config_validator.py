@@ -27,18 +27,17 @@ class ConfigValidator:
         cron = {
             'check': str,
             'cleanup': str,
-            'image-update': str,
         }
 
         images = {
             'name': str,
-            'base-image': str,
+            'pause': bool,
             'min-ram': int,
             'name-filter': str,
             'diskimage': str,
             'meta': dict,
-            'setup': str,
             'username': str,
+            'user-home': str,
             'private-key': str,
             'config-drive': bool,
         }
@@ -107,13 +106,14 @@ class ConfigValidator:
 
         diskimages = {
             'name': str,
+            'pause': bool,
             'elements': [str],
             'release': v.Any(str, int),
+            'rebuild-age': int,
             'env-vars': dict,
         }
 
         top_level = {
-            'script-dir': str,
             'elements-dir': str,
             'images-dir': str,
             'dburi': str,
